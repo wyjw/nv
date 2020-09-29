@@ -602,10 +602,21 @@ extern const struct block_device_operations nvme_ns_head_ops;
 // alter -- treenvme
 extern const struct block_device_operations treenvme_fops;
 extern const struct block_device_operations treenvme_head_ops;
-void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
+//void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
 int nvme_identify_ns(struct nvme_ctrl *ctrl, unsigned nsid, struct nvme_id_ns **id);    
-int nvme_set_queue_limits(struct nvme_ctrl *ctrl, struct request_queue *q);
+void nvme_set_queue_limits(struct nvme_ctrl *ctrl, struct request_queue *q);
 void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id); 
+int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd, void __user *ubuffer, unsigned bufflen, void __user *meta_buffer, unsigned meta_len, u32 meta_seed, u64 *result, unsigned timeout);
+
+#ifdef CONFIG_TREENVME
+void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
+void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags);
+int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
+#else
+static inline void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid){
+}
+#endif /* CONFIG_NVME_MULTIPATH */
+
 
 #ifdef CONFIG_NVME_MULTIPATH
 static inline bool nvme_ctrl_use_ana(struct nvme_ctrl *ctrl)
@@ -727,15 +738,6 @@ static inline void nvme_mpath_start_freeze(struct nvme_subsystem *subsys)
 {
 }
 #endif /* CONFIG_NVME_MULTIPATH */
-
-#ifdef CONFIG_TREENVME
-static inline void treenvme_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id)
-{
-}
-void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags);
-#endif /* CONFIG_NVME_MULTIPATH */
-
-
 
 #ifdef CONFIG_NVM
 int nvme_nvm_register(struct nvme_ns *ns, char *disk_name, int node);

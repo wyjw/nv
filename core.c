@@ -895,7 +895,7 @@ out:
 	return ERR_PTR(ret);
 }
 
-static int nvme_submit_user_cmd(struct request_queue *q,
+int nvme_submit_user_cmd(struct request_queue *q,
 		struct nvme_command *cmd, void __user *ubuffer,
 		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
 		u32 meta_seed, u64 *result, unsigned timeout)
@@ -952,6 +952,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 	blk_mq_free_request(req);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(nvme_submit_user_cmd);
 
 static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
 {
@@ -2125,197 +2126,6 @@ const struct block_device_operations nvme_ns_head_ops = {
 #endif /* CONFIG_NVME_MULTIPATH */
 
 #ifdef CONFIG_TREENVME
-static void *treenvme_add_user_metadata(struct bio *bio, void __user *ubuf,
-		unsigned len, u32 seed, bool write)
-{
-	struct bio_integrity_payload *bip;
-	int ret = -ENOMEM;
-	void *buf;
-
-	buf = kmalloc(len, GFP_KERNEL);
-	if (!buf)
-		goto out;
-
-	ret = -EFAULT;
-	if (write && copy_from_user(buf, ubuf, len))
-		goto out_free_meta;
-
-	bip = bio_integrity_alloc(bio, GFP_KERNEL, 1);
-	if (IS_ERR(bip)) {
-		ret = PTR_ERR(bip);
-		goto out_free_meta;
-	}
-
-	bip->bip_iter.bi_size = len;
-	bip->bip_iter.bi_sector = seed;
-	ret = bio_integrity_add_page(bio, virt_to_page(buf), len,
-			offset_in_page(buf));
-	if (ret == len)
-		return buf;
-	ret = -ENOMEM;
-out_free_meta:
-	kfree(buf);
-out:
-	return ERR_PTR(ret);
-}
-
-static int treenvme_submit_user_cmd(struct request_queue *q,
-		struct nvme_command *cmd, void __user *ubuffer,
-		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
-		u32 meta_seed, u64 *result, unsigned timeout)
-{
-	bool write = nvme_is_write(cmd);
-	struct nvme_ns *ns = q->queuedata;
-	struct gendisk *disk = ns ? ns->disk : NULL;
-	struct request *req;
-	struct bio *bio = NULL;
-	void *meta = NULL;
-	int ret;
-
-	req = nvme_alloc_request(q, cmd, 0, NVME_QID_ANY);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
-
-	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
-	nvme_req(req)->flags |= NVME_REQ_USERCMD;
-
-	if (ubuffer && bufflen) {
-		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
-				GFP_KERNEL);
-		if (ret)
-			goto out;
-		bio = req->bio;
-		bio->bi_disk = disk;
-		if (disk && meta_buffer && meta_len) {
-			meta = treenvme_add_user_metadata(bio, meta_buffer, meta_len,
-					meta_seed, write);
-			if (IS_ERR(meta)) {
-				ret = PTR_ERR(meta);
-				goto out_unmap;
-			}
-			req->cmd_flags |= REQ_INTEGRITY;
-		}
-	}
-
-	blk_execute_rq(req->q, disk, req, 0);
-	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
-		ret = -EINTR;
-	else
-		ret = nvme_req(req)->status;
-	if (result)
-		*result = le64_to_cpu(nvme_req(req)->result.u64);
-	if (meta && !ret && !write) {
-		if (copy_to_user(meta_buffer, meta, meta_len))
-			ret = -EFAULT;
-	}
-	kfree(meta);
- out_unmap:
-	if (bio)
-		blk_rq_unmap_user(bio);
- out:
-	blk_mq_free_request(req);
-	return ret;
-}
-
-static int treenvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
-{
-	struct nvme_user_io io;
-	struct nvme_command c;
-	unsigned length, meta_len;
-	void __user *metadata;
-
-	if (copy_from_user(&io, uio, sizeof(io)))
-		return -EFAULT;
-	if (io.flags)
-		return -EINVAL;
-
-	switch (io.opcode) {
-	case nvme_cmd_write:
-	case nvme_cmd_read:
-	case nvme_cmd_compare:
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	length = (io.nblocks + 1) << ns->lba_shift;
-	meta_len = (io.nblocks + 1) * ns->ms;
-	metadata = nvme_to_user_ptr(io.metadata);
-
-	if (ns->ext) {
-		length += meta_len;
-		meta_len = 0;
-	} else if (meta_len) {
-		if ((io.metadata & 3) || !io.metadata)
-			return -EINVAL;
-	}
-
-	memset(&c, 0, sizeof(c));
-	c.rw.opcode = io.opcode;
-	c.rw.flags = io.flags;
-	c.rw.nsid = cpu_to_le32(ns->head->ns_id);
-	c.rw.slba = cpu_to_le64(io.slba);
-	c.rw.length = cpu_to_le16(io.nblocks);
-	c.rw.control = cpu_to_le16(io.control);
-	c.rw.dsmgmt = cpu_to_le32(io.dsmgmt);
-	c.rw.reftag = cpu_to_le32(io.reftag);
-	c.rw.apptag = cpu_to_le16(io.apptag);
-	c.rw.appmask = cpu_to_le16(io.appmask);
-
-	return nvme_submit_user_cmd(ns->queue, &c,
-			nvme_to_user_ptr(io.addr), length,
-			metadata, meta_len, lower_32_bits(io.slba), NULL, 0);
-}
-
-static int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
-		unsigned int cmd, unsigned long arg)
-{
-	struct nvme_ns_head *head = NULL;
-	void __user *argp = (void __user *)arg;
-	struct nvme_ns *ns;
-	int srcu_idx, ret;
-
-	ns = bdev->bd_disk->private_data;
-	if (unlikely(!ns))
-		return -EWOULDBLOCK;
-
-	/*
-	 * Handle ioctls that apply to the controller instead of the namespace
-	 * seperately and drop the ns SRCU reference early.  This avoids a
-	 * deadlock when deleting namespaces using the passthrough interface.
-	 */
-	if (is_ctrl_ioctl(cmd))
-		return nvme_handle_ctrl_ioctl(ns, cmd, argp, head, srcu_idx);
-
-	switch (cmd) {
-	/*
-	case NVME_IOCTL_ID:
-		force_successful_syscall_return();
-		ret = ns->head->ns_id;
-		break;
-	case NVME_IOCTL_IO_CMD:
-		ret = nvme_user_cmd(ns->ctrl, ns, argp);
-		break;
-	*/
-	case NVME_IOCTL_SUBMIT_IO:
-		ret = treenvme_submit_io(ns, argp);
-		break;
-	/*
-	case NVME_IOCTL_IO64_CMD:
-		ret = nvme_user_cmd64(ns->ctrl, ns, argp);
-		break;
-	*/
-	default:
-		if (ns->ndev)
-			ret = nvme_nvm_ioctl(ns, cmd, arg);
-		else
-			ret = -ENOTTY;
-	}
-
-	nvme_put_ns_from_disk(head, srcu_idx);
-	return ret;
-}
-
 const struct block_device_operations treenvme_fops = {
 	.owner		= THIS_MODULE,
 	.open		= nvme_open,

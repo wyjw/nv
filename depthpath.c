@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/blkdev.h>
 #include <linux/treenvme.h>
+#include <linux/nvme_ioctl.h>
 #include <trace/events/block.h>
 #include "nvme.h"
 
@@ -31,6 +32,7 @@ struct block_table {
 };
 
 static struct treenvme_ctx *tctx;
+static const struct file_operations treenvme_ctrl_fops;
 
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags)
 {
@@ -169,10 +171,8 @@ static int treenvme_get_fd(struct treenvme_ctx *tctx)
 
 	ret = get_unused_fd_flags( O_RDWR | O_CLOEXEC );
 	if (ret < 0)
-		goto err;
-
-	file = anon_inode_getfile("[treenvme]", &treenvme_ctrl_fops, tctx, O_RWDR | O_CLOEXEC);
-
+		goto err; 
+	file = anon_inode_getfile("[treenvme]", &treenvme_ctrl_fops, tctx, O_RDWR | O_CLOEXEC);
 	if (IS_ERR(file)){
 		put_unused_fd(ret);
 		ret = PTR_ERR(file);
@@ -276,6 +276,13 @@ static int treenvme_submit_user_cmd(struct request_queue *q,
 	return ret;
 }
 
+static void __user *nvme_to_user_ptr(uintptr_t ptrval)
+{
+	if (in_compat_syscall())
+		ptrval = (compat_uptr_t)ptrval;
+	return (void __user *)ptrval;
+}
+
 static int treenvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 {
 	struct nvme_user_io io;
@@ -321,12 +328,18 @@ static int treenvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *ui
 	c.rw.apptag = cpu_to_le16(io.apptag);
 	c.rw.appmask = cpu_to_le16(io.appmask);
 
-	return nvme_submit_user_cmd(ns->queue, &c,
+	return treenvme_submit_user_cmd(ns->queue, &c,
 			nvme_to_user_ptr(io.addr), length,
 			metadata, meta_len, lower_32_bits(io.slba), NULL, 0);
 }
 
-static int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
+static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
+{
+	if (head)
+		srcu_read_unlock(&head->srcu, idx);
+}
+
+int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
 		unsigned int cmd, unsigned long arg)
 {
 	struct nvme_ns_head *head = NULL;
@@ -343,9 +356,11 @@ static int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
 	 * seperately and drop the ns SRCU reference early.  This avoids a
 	 * deadlock when deleting namespaces using the passthrough interface.
 	 */
-	if (is_ctrl_ioctl(cmd))
+	
+	/*
+	 * if (is_ctrl_ioctl(cmd))
 		return nvme_handle_ctrl_ioctl(ns, cmd, argp, head, srcu_idx);
-
+	*/
 	switch (cmd) {
 	/*
 	case NVME_IOCTL_ID:
@@ -388,9 +403,22 @@ static void __exit treenvme_exit(void)
 	kfree(tctx);
 }
 
-static const struct file_operations treenvme_ctrl_fops {
-	.mmap = treenvme_mmap,
+static const struct file_operations treenvme_ctrl_fops = {
+	.owner		= THIS_MODULE,
+	.mmap		= treenvme_mmap,
 };
+
+/*
+const struct block_device_operations treenvme_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nvme_open,
+	.release	= nvme_release,
+	.ioctl		= treenvme_ioctl,
+	.compat_ioctl	= nvme_compat_ioctl,
+	.getgeo		= nvme_getgeo,
+	.pr_ops		= &nvme_pr_ops,
+};
+*/
 
 MODULE_AUTHOR("Yu Jian <yujian.wu1@gmail.com>");
 MODULE_LICENSE("GPL");
