@@ -12,15 +12,22 @@
 #include <linux/nvme_ioctl.h>
 #include <trace/events/block.h>
 #include "nvme.h"
+#include "tokuspec.h"
 
 static bool depthpath = true;
 module_param(depthpath, bool, 0444);
 MODULE_PARM_DESC(depthpath,
 	"turn on native support for per subsystem");
 
+static int depthcount = 4;
+module_param(depthcount, int, 0644);
+MODULE_PARM_DESC(depthcount, "number of rebound in the backpath");
+
 struct nvme_dev;
-struct nvme_queue;
+struct nvme_completion;
 struct block_table;
+struct pivot_bounds;
+struct DBT;
 
 struct treenvme_ctx {
 	struct nvme_dev *dev;
@@ -33,6 +40,8 @@ struct block_table {
 
 static struct treenvme_ctx *tctx;
 static const struct file_operations treenvme_ctrl_fops;
+static struct kmem_cache *node_cachep; 
+static int page_match(char *page, int page_size);
 
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags)
 {
@@ -392,10 +401,276 @@ int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
 
 // end
 
+static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
+{
+	if (!nvmeq->qid)
+		return nvmeq->dev->admin_tagset.tags[0];
+	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
+}
+
+inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	//struct nvme_queue *nvmeq = iod->nvmeq;
+	struct nvme_ns *ns = req->q->queuedata;
+	struct nvme_dev *dev = iod->nvmeq->dev;
+	struct nvme_command cmnd;
+	blk_status_t ret;
+
+	//printk(KERN_ERR "GOT HERE -- rebound \n");
+	if (req->alter_count < depthcount)
+	{
+		req->alter_count += 1;
+		// alter
+		ret = nvme_setup_cmd(ns, req, &cmnd);
+		if (ret)
+			printk(KERN_ERR "submit error\n");
+		//printk(KERN_ERR "Got here 2\n");x
+		if (blk_rq_nr_phys_segments(req)) {
+			ret = nvme_map_data(dev, req, &cmnd);
+			if (ret)
+				printk(KERN_ERR "mapping error\n");
+		}
+		if (blk_integrity_rq(req)) {
+			ret = nvme_map_metadata(dev, req, &cmnd);
+			if (ret)
+				printk(KERN_ERR "meta error\n");
+		}
+		cmnd.rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
+		//printk(KERN_ERR "SECTOR NUMBER IS %u\n", cmnd.rw.slba);
+
+		int ret;
+		struct bio_vec bvec;
+		struct req_iterator iter;
+
+		rq_for_each_segment(bvec, req, iter)
+		{
+			char *buffer = bio_data(req->bio);
+			printk(KERN_ERR "char bio: %s \n", buffer);
+			printk(KERN_ERR "char is: %c\n", buffer[2]);
+			
+			// retry
+			int next_page;
+			next_page = page_match(buffer, 4096);
+			printk(KERN_ERR "SECTOR NUMBER IS %u\n", cmnd.rw.slba);
+			cmnd.rw.slba = cpu_to_le64(next_page);
+			req->__sector = cmnd.rw.slba;
+			/*
+			if (buffer[a] == "a"){
+				cmnd.rw.slba += cpu_to_le64(cmnd.rw.slba * 2);
+				printk(KERN_ERR "SECTOR NUMBER IS %u\n", cmnd.rw.slba);
+				printk(KERN_ERR "matched.\n");
+				req->__sector = cmnd.rw.slba;
+			}
+			*/
+		}
+		nvme_req(req)->cmd = &cmnd;
+		nvme_submit_cmd(nvmeq, &cmnd, true);
+	}
+	else
+	{
+		//printk(KERN_ERR "Final\n");
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		nvme_end_request(req, cqe->status, cqe->result);
+	}
+
+}
+
+void init_pivot(struct pivot_bounds *pb, int num) {
+	pb->num_pivots = num;
+	pb->total_size = 0;
+	pb->fixed_keys = NULL;
+	pb->fixed_keylen_aligned = 0;
+	pb->dbt_keys = NULL;
+}
+
+typedef int (*comparator)(char *a, char *b, int asize, int bsize);
+
+enum search_direction {
+	LEFT_TO_RIGHT,
+	RIGHT_TO_LEFT
+};
+
+struct search_ctx {
+	comparator compare;
+	enum search_direction direction;
+       	const struct DBT *k;
+	void *user_data;
+	struct DBT *pivot_bound;	
+	const struct DBT *k_bound;
+};
+
+static void init_DBT(struct DBT *new)
+{
+	memset(new, 0, sizeof(*new));
+	return new;
+}
+
+static int compare (struct search_ctx *srch, struct DBT *keya, struct DBT *keyb)
+{
+	char *keyadata = keya->data;
+	char *keybdata = keyb->data;
+	if (srch->compare(keyadata, keybdata, keya->size, keyb->size))
+	{
+		return 0;
+	}
+	else {
+		return 1;
+	}
+}
+int fill_pivot(struct pivot_bounds *pb, char *page, int n)
+{
+	int k = 0;
+	int i = 0;
+
+	pb->num_pivots = n;
+	pb->total_size = 0;
+	pb->fixed_keys = NULL;
+	pb->fixed_keylen = 0;
+	pb->dbt_keys = NULL;
+
+	pb->dbt_keys = kmalloc(sizeof(struct DBT) * pb->num_pivots, GFP_KERNEL);
+	for (i = 0; i < n; i++) {
+		uint32_t size;
+		memcmp(&size, page[k], 4);
+		k += 4;
+		memcmp(&pb->dbt_keys[i], page[k], size);
+		pb->total_size += size;
+	       	k += size;	
+	}
+	return k;
+}
+
+struct block_data {
+	int start;
+	int end;
+	int size;
+};
+
+struct subblock_data {
+	void *ptr;
+	uint32_t size;
+};
+
+// Reference: toku_deserialize_bp_from_disk
+static void deserialize(char *page, struct tokunode *node) 
+{
+	struct block_data *bd;
+	// node->blocknum = blocknum;
+	node->blocknum = 0;
+	node->bp = NULL;
+	node->ct_pair = NULL;
+	
+	int i = 0;
+	int j; 
+	int k;
+	int l;
+
+	char buffer[8];
+	memcpy(buffer, &page[i], 8);
+       	i += 8;
+	if (memcmp(buffer, "tokuleaf", 8) != 0 
+	   && memcmp(buffer, "tokunode", 8) != 0)
+		printk(KERN_WARNING "No leaf word in buffer.\n");
+
+	int version;
+	memcpy(&version, &page[i], 4);
+	i += 4;
+
+	i += 8; // skip layout version and build id
+	
+	int num_child;
+	memcpy(&num_child, &page[i], 4);
+	i += 4;
+	node->n_children = num_child;
+
+	// node->bp = kmalloc(sizeof(struct ftnode_partition) * num_child, GFP_KERNEL);
+	bd = kmalloc(sizeof(struct block_data), GFP_KERNEL);
+
+	for (j = 0; j < node->n_children; j++) {
+		memcmp(&bd[i].start, &page[i], 4);
+		i += 4;
+		memcmp(&bd[i].end, &page[i], 4);
+		i += 4;
+		bd[i].size = bd[i].start - bd[i].end;
+	}
+
+	i += 4; // skip checksumming
+
+	struct subblock_data sb_data;
+	memcmp(&sb_data.size, &page[i], 4);
+	i += 4;
+	i += 4; // skip compressing
+
+	const void **cp;
+	memcmp(&cp, &page[i], sb_data.size);
+
+	// get from subblock_data
+	uint32_t data_size = sb_data.size - 4;
+
+	char bufferd[data_size];
+	memcpy(&bufferd, &page[i], data_size);
+	i += data_size;
+
+	k = 0;
+	memcmp(&node->flags, &bufferd[k], 8);
+	k += 8;
+	memcmp(&node->height, &bufferd[k], 4);
+	k += 8;
+		
+	node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
+	if (node->n_children > 1){
+		k += fill_pivot(node->pivotkeys, &bufferd[k], node->n_children); 
+	}	
+	else {
+		init_pivot(node->pivotkeys, 0);
+	}
+
+	// Block nums
+	if (node->height > 0) {
+		for (l = 0; l < node->n_children; l++) {
+			memcmp(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
+			k += 4;				
+		}
+	}
+}
+
+static int page_match(char *page, int page_size)
+{
+	struct tokunode *node = kmem_cache_alloc(node_cachep, GFP_KERNEL);
+
+	deserialize(page, node);
+
+	int low = 0;
+	int high = node->n_children - 1;
+	int middle;
+	struct DBT pivot_key;
+	init_DBT(&pivot_key);
+
+	struct search_ctx *search = kmalloc(sizeof(struct search_ctx), GFP_KERNEL);
+	while (low < high)
+	{
+		middle = (low + high) / 2;
+		bool c = compare(search, &node->pivotkeys->dbt_keys[low], &node->pivotkeys->dbt_keys[high]);
+		if (((search->direction == LEFT_TO_RIGHT) && c) || (search->direction == RIGHT_TO_LEFT && !c))
+		{	
+			high = middle;
+		}
+		else {
+			low = middle + 1;
+		}		
+	}
+
+	return (node)->pivotkeys->dbt_keys[low].blocknum;	
+}
+
 static int __init treenvme_init(void)
 {
 	tctx = kmalloc(sizeof(struct treenvme_ctx), GFP_NOWAIT);
 	tctx->bt = kmalloc(sizeof(struct block_table), GFP_NOWAIT);	
+	
+	// this is how we keep the nodes in memory
+	node_cachep = KMEM_CACHE(tokunode, SLAB_HWCACHE_ALIGN | SLAB_PANIC);	
 }
 
 static void __exit treenvme_exit(void)
