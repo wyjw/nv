@@ -14,6 +14,8 @@
 #include "nvme.h"
 #include "tokuspec.h"
 
+#define DEBUG 1
+
 static bool depthpath = true;
 module_param(depthpath, bool, 0444);
 MODULE_PARM_DESC(depthpath,
@@ -169,6 +171,7 @@ inline void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned ns
 
 	__nvme_revalidate_disk(treedisk, id);
 	nvme_get_ctrl(ctrl);
+	printk(KERN_ERR "Disk name added is: %s\n", disk_name);
 	device_add_disk(ctrl->device, ns->tdisk, nvme_ns_id_attr_groups);	
 
 }	
@@ -418,7 +421,7 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 	blk_status_t ret;
 
 	//printk(KERN_ERR "GOT HERE -- rebound \n");
-	if (req->alter_count < depthcount)
+	if (req->alter_count < depthcount && !op_is_write(req_op(req)))
 	{
 		req->alter_count += 1;
 		// alter
@@ -452,6 +455,8 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 			// retry
 			int next_page;
 			next_page = page_match(buffer, 4096);
+			if (next_page == 0)
+				goto ERROR;
 			printk(KERN_ERR "SECTOR NUMBER IS %u\n", cmnd.rw.slba);
 			cmnd.rw.slba = cpu_to_le64(next_page);
 			req->__sector = cmnd.rw.slba;
@@ -469,6 +474,7 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 	}
 	else
 	{
+ERROR:
 		//printk(KERN_ERR "Final\n");
 		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
@@ -553,14 +559,22 @@ struct subblock_data {
 };
 
 // Reference: toku_deserialize_bp_from_disk
-static void deserialize(char *page, struct tokunode *node) 
+static int deserialize(char *page, struct tokunode *node) 
 {
 	struct block_data *bd;
 	// node->blocknum = blocknum;
 	node->blocknum = 0;
 	node->bp = NULL;
 	node->ct_pair = NULL;
+	int z = 0;
 	
+	for (z = 0; z < 512; z++){
+		if (page[z] != 0)
+		{
+			printk(KERN_ERR "we have %u @ %u", page[z], z);
+		}	
+	}
+		
 	int i = 0;
 	int j; 
 	int k;
@@ -572,32 +586,50 @@ static void deserialize(char *page, struct tokunode *node)
 	if (memcmp(buffer, "tokuleaf", 8) != 0 
 	   && memcmp(buffer, "tokunode", 8) != 0)
 		printk(KERN_WARNING "No leaf word in buffer.\n");
+#ifdef DEBUG
+	printk(KERN_ERR "BUFFER: %.*s\n", 8, buffer);
+#endif
 
-	int version;
+	uint32_t version;
 	memcpy(&version, &page[i], 4);
 	i += 4;
 
+#ifdef DEBUG
+	printk(KERN_ERR "VERSION_NUM: %u\n", version);
+#endif
+
 	i += 8; // skip layout version and build id
 	
-	int num_child;
+	uint32_t num_child;
 	memcpy(&num_child, &page[i], 4);
 	i += 4;
 	node->n_children = num_child;
 
+#ifdef DEBUG
+	printk(KERN_ERR "NUM_CHILD: %u\n", num_child);
+#endif
+
 	// node->bp = kmalloc(sizeof(struct ftnode_partition) * num_child, GFP_KERNEL);
-	bd = kmalloc(sizeof(struct block_data), GFP_KERNEL);
+	bd = kmalloc(sizeof(struct block_data) * num_child, GFP_KERNEL);
 
 	for (j = 0; j < node->n_children; j++) {
-		memcmp(&bd[i].start, &page[i], 4);
+		memcmp(&bd[j].start, &page[i], 4);
 		i += 4;
-		memcmp(&bd[i].end, &page[i], 4);
+		memcmp(&bd[j].end, &page[i], 4);
 		i += 4;
-		bd[i].size = bd[i].start - bd[i].end;
+		bd[j].size = bd[j].start - bd[j].end;
+#ifdef DEBUG
+	printk("BLOCK: %u\n", j);
+	printk("BLOCK_START: %u\n", bd[j].start);
+	printk("BLOCK_END: %u\n", bd[j].end);	
+	printk("BLOCK_SIZE: %u\n", bd[j].size); 
+#endif
 	}
 
 	i += 4; // skip checksumming
 
 	struct subblock_data sb_data;
+	sb_data.size = 0;
 	memcmp(&sb_data.size, &page[i], 4);
 	i += 4;
 	i += 4; // skip compressing
@@ -606,40 +638,59 @@ static void deserialize(char *page, struct tokunode *node)
 	memcmp(&cp, &page[i], sb_data.size);
 
 	// get from subblock_data
-	uint32_t data_size = sb_data.size - 4;
+	uint32_t data_size = 0;
+	if (sb_data.size != 0) 
+		data_size = sb_data.size - 4;
 
-	char bufferd[data_size];
-	memcpy(&bufferd, &page[i], data_size);
-	i += data_size;
+#ifdef DEBUG 
+	printk("DATA_SIZE: %d\n", sb_data.size);
+#endif
 
-	k = 0;
-	memcmp(&node->flags, &bufferd[k], 8);
-	k += 8;
-	memcmp(&node->height, &bufferd[k], 4);
-	k += 8;
-		
-	node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
-	if (node->n_children > 1){
-		k += fill_pivot(node->pivotkeys, &bufferd[k], node->n_children); 
-	}	
-	else {
-		init_pivot(node->pivotkeys, 0);
-	}
+	if (data_size != 0) 
+	{
+		char bufferd[data_size];
+		memcpy(&bufferd, &page[i], data_size);
+		i += data_size;
 
-	// Block nums
-	if (node->height > 0) {
-		for (l = 0; l < node->n_children; l++) {
-			memcmp(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
-			k += 4;				
+		k = 0;
+		memcmp(&node->flags, &bufferd[k], 8);
+		k += 8;
+		memcmp(&node->height, &bufferd[k], 4);
+		k += 8;
+		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
+		if (node->n_children > 1){
+			k += fill_pivot(node->pivotkeys, &bufferd[k], node->n_children); 
+		}	
+		else {
+			init_pivot(node->pivotkeys, 0);
 		}
+
+		// Block nums
+		if (node->height > 0) {
+			for (l = 0; l < node->n_children; l++) {
+				memcmp(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
+				k += 4;
+#ifdef DEBUG
+	printk("CHILD_BLOCKNUM: %d", node->pivotkeys->dbt_keys[l].blocknum);
+#endif			
+			}
+		}
+		return 1; 
 	}
+	else {
+		k += 16;
+		goto ERROR;
+	}
+ERROR:
+	return 0;	
 }
 
 static int page_match(char *page, int page_size)
 {
 	struct tokunode *node = kmem_cache_alloc(node_cachep, GFP_KERNEL);
 
-	deserialize(page, node);
+	if (deserialize(page, node) == 0)
+		return 0;
 
 	int low = 0;
 	int high = node->n_children - 1;
@@ -660,6 +711,10 @@ static int page_match(char *page, int page_size)
 			low = middle + 1;
 		}		
 	}
+#ifdef DEBUG
+	if (!node)
+		printk(KERN_ERR "Node is NULL\n");
+#endif
 
 	return (node)->pivotkeys->dbt_keys[low].blocknum;	
 }

@@ -778,7 +778,7 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 	cmd->common.command_id = req->tag;
 
 	// alter
-	if (req->alter_count == 0)
+	if (req)
 	{
 		req->first_command_id = cmd->common.command_id;
 	}
