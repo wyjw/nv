@@ -451,7 +451,8 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 			char *buffer = bio_data(req->bio);
 			printk(KERN_ERR "char bio: %s \n", buffer);
 			printk(KERN_ERR "char is: %c\n", buffer[2]);
-			
+		
+			printk(KERN_ERR "size is: %u\n", req->bio->bi_iter.bi_size);
 			// retry
 			int next_page;
 			next_page = page_match(buffer, 4096);
@@ -548,14 +549,15 @@ int fill_pivot(struct pivot_bounds *pb, char *page, int n)
 }
 
 struct block_data {
-	int start;
-	int end;
-	int size;
+	uint32_t start;
+	uint32_t end;
+	uint32_t size;
 };
 
 struct subblock_data {
 	void *ptr;
-	uint32_t size;
+	uint32_t csize; // compressed size
+	uint32_t usize; // uncompressed size
 };
 
 // Reference: toku_deserialize_bp_from_disk
@@ -585,7 +587,10 @@ static int deserialize(char *page, struct tokunode *node)
        	i += 8;
 	if (memcmp(buffer, "tokuleaf", 8) != 0 
 	   && memcmp(buffer, "tokunode", 8) != 0)
+	{
 		printk(KERN_WARNING "No leaf word in buffer.\n");
+		goto ERROR;
+	}
 #ifdef DEBUG
 	printk(KERN_ERR "BUFFER: %.*s\n", 8, buffer);
 #endif
@@ -613,13 +618,14 @@ static int deserialize(char *page, struct tokunode *node)
 	bd = kmalloc(sizeof(struct block_data) * num_child, GFP_KERNEL);
 
 	for (j = 0; j < node->n_children; j++) {
-		memcmp(&bd[j].start, &page[i], 4);
+		//printk("PAGE HERE IS: %u\n", page[i]);
+		memcpy(&bd[j].start, &page[i], 4);
 		i += 4;
-		memcmp(&bd[j].end, &page[i], 4);
+		memcpy(&bd[j].size, &page[i], 4);
 		i += 4;
-		bd[j].size = bd[j].start - bd[j].end;
+		bd[j].end = bd[j].start + bd[j].size;
 #ifdef DEBUG
-	printk("BLOCK: %u\n", j);
+	printk("CHILD_NUM: %u\n", j);
 	printk("BLOCK_START: %u\n", bd[j].start);
 	printk("BLOCK_END: %u\n", bd[j].end);	
 	printk("BLOCK_SIZE: %u\n", bd[j].size); 
@@ -629,21 +635,42 @@ static int deserialize(char *page, struct tokunode *node)
 	i += 4; // skip checksumming
 
 	struct subblock_data sb_data;
-	sb_data.size = 0;
-	memcmp(&sb_data.size, &page[i], 4);
+	sb_data.csize = 0;
+	sb_data.usize = 0;
+	
+	// compressed size
+	memcpy(&sb_data.csize, &page[i], 4);
 	i += 4;
-	i += 4; // skip compressing
 
-	const void **cp;
-	memcmp(&cp, &page[i], sb_data.size);
+	// uncompressed size
+	memcpy(&sb_data.usize, &page[i], 4);
+	
+	/*
+	for (j = 0; i < 400; j++) {
+		memcpy(&sb_data.usize, &page[i], 4);
+		i += 4;
+	}
+	*/
+
+#ifdef DEBUG
+	printk("COMPRESSED_SIZE: %u\n", sb_data.csize);
+	printk("UNCOMPRESSED_SIZE: %u\n", sb_data.usize);
+	printk("COUNTER IS AT: %u\n", i);
+#endif
+	
+	// skip compressing
+
+	char *cp = kmalloc(sizeof(int) * sb_data.usize, GFP_KERNEL);
+	memcpy(cp, &page[i], sb_data.usize);
+	//memcpy(&cp, &page[i], 4);
 
 	// get from subblock_data
 	uint32_t data_size = 0;
-	if (sb_data.size != 0) 
-		data_size = sb_data.size - 4;
+	if (sb_data.usize != 0) 
+		data_size = sb_data.usize - 4;
 
 #ifdef DEBUG 
-	printk("DATA_SIZE: %d\n", sb_data.size);
+	printk("DATA_SIZE: %u\n", data_size);
 #endif
 
 	if (data_size != 0) 
@@ -653,9 +680,9 @@ static int deserialize(char *page, struct tokunode *node)
 		i += data_size;
 
 		k = 0;
-		memcmp(&node->flags, &bufferd[k], 8);
+		memcpy(&node->flags, &bufferd[k], 8);
 		k += 8;
-		memcmp(&node->height, &bufferd[k], 4);
+		memcpy(&node->height, &bufferd[k], 4);
 		k += 8;
 		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
 		if (node->n_children > 1){
@@ -668,13 +695,14 @@ static int deserialize(char *page, struct tokunode *node)
 		// Block nums
 		if (node->height > 0) {
 			for (l = 0; l < node->n_children; l++) {
-				memcmp(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
+				memcpy(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
 				k += 4;
 #ifdef DEBUG
-	printk("CHILD_BLOCKNUM: %d", node->pivotkeys->dbt_keys[l].blocknum);
+	printk("CHILD_BLOCKNUM: %d\n", node->pivotkeys->dbt_keys[l].blocknum);
 #endif			
 			}
 		}
+
 		return 1; 
 	}
 	else {
