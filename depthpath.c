@@ -15,6 +15,7 @@
 #include "tokuspec.h"
 
 #define DEBUG 1
+//#define DEBUGMAX 0
 
 static bool depthpath = true;
 module_param(depthpath, bool, 0444);
@@ -541,7 +542,10 @@ int fill_pivot(struct pivot_bounds *pb, char *page, int n)
 		uint32_t size;
 		memcmp(&size, page[k], 4);
 		k += 4;
-		memcmp(&pb->dbt_keys[i], page[k], size);
+		memcmp(&pb->dbt_keys[i].data, page[k], size);
+#ifdef DEBUG
+	printk("Data is %s\n", &pb->dbt_keys[i].data);
+#endif
 		pb->total_size += size;
 	       	k += size;	
 	}
@@ -569,18 +573,21 @@ static int deserialize(char *page, struct tokunode *node)
 	node->bp = NULL;
 	node->ct_pair = NULL;
 	int z = 0;
-	
+
+#ifdef DEBUGMAX	
 	for (z = 0; z < 512; z++){
 		if (page[z] != 0)
 		{
 			printk(KERN_ERR "we have %u @ %u", page[z], z);
 		}	
 	}
-		
+#endif
+
 	int i = 0;
 	int j; 
 	int k;
 	int l;
+	int m = 0;
 
 	char buffer[8];
 	memcpy(buffer, &page[i], 8);
@@ -644,7 +651,7 @@ static int deserialize(char *page, struct tokunode *node)
 
 	// uncompressed size
 	memcpy(&sb_data.usize, &page[i], 4);
-	
+	i += 4;	
 	/*
 	for (j = 0; i < 400; j++) {
 		memcpy(&sb_data.usize, &page[i], 4);
@@ -673,16 +680,31 @@ static int deserialize(char *page, struct tokunode *node)
 	printk("DATA_SIZE: %u\n", data_size);
 #endif
 
+#ifdef DEBUG	
+	for (z = 0; z < data_size; z++){
+		if (cp[z] != 0)
+		{
+			printk(KERN_ERR "we have %u @ %u in subblock", cp[z], z);
+		}	
+	}
+#endif
 	if (data_size != 0) 
 	{
 		char bufferd[data_size];
-		memcpy(&bufferd, &page[i], data_size);
-		i += data_size;
+		memcpy(&bufferd, &cp[m], data_size);
+		m += data_size;
 
 		k = 0;
 		memcpy(&node->flags, &bufferd[k], 8);
+
 		k += 8;
 		memcpy(&node->height, &bufferd[k], 4);
+
+#ifdef DEBUG
+	printk("Node flags of %u\n", node->flags);
+	printk("Node height of %u\n", node->height);
+#endif
+
 		k += 8;
 		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
 		if (node->n_children > 1){
@@ -730,6 +752,7 @@ static int page_match(char *page, int page_size)
 	while (low < high)
 	{
 		middle = (low + high) / 2;
+		/*	
 		bool c = compare(search, &node->pivotkeys->dbt_keys[low], &node->pivotkeys->dbt_keys[high]);
 		if (((search->direction == LEFT_TO_RIGHT) && c) || (search->direction == RIGHT_TO_LEFT && !c))
 		{	
@@ -737,7 +760,9 @@ static int page_match(char *page, int page_size)
 		}
 		else {
 			low = middle + 1;
-		}		
+		}
+		*/
+		break;		
 	}
 #ifdef DEBUG
 	if (!node)
