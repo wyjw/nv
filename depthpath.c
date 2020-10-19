@@ -540,11 +540,12 @@ int fill_pivot(struct pivot_bounds *pb, char *page, int n)
 	pb->dbt_keys = kmalloc(sizeof(struct DBT) * pb->num_pivots, GFP_KERNEL);
 	for (i = 0; i < n; i++) {
 		uint32_t size;
-		memcmp(&size, page[k], 4);
+		memcpy(&size, &page[k], 4);
 		k += 4;
-		memcmp(&pb->dbt_keys[i].data, page[k], size);
+		memcpy(&pb->dbt_keys[i].data, &page[k], size);
 #ifdef DEBUG
-	printk("Data is %s\n", &pb->dbt_keys[i].data);
+	printk("Size is %u\n", size);
+	printk("Data is %u\n", pb->dbt_keys[i].data);
 #endif
 		pb->total_size += size;
 	       	k += size;	
@@ -667,8 +668,15 @@ static int deserialize(char *page, struct tokunode *node)
 	
 	// skip compressing
 
-	char *cp = kmalloc(sizeof(int) * sb_data.usize, GFP_KERNEL);
-	memcpy(cp, &page[i], sb_data.usize);
+	char *cp = kmalloc(sizeof(int) * sb_data.csize, GFP_KERNEL);
+	memcpy(cp, &page[i], sb_data.csize);
+	
+	// decompress by moving everything one to the left
+	char *temp = kmalloc(sizeof(int) * sb_data.usize, GFP_KERNEL);
+	memcpy(temp, cp + 1, sb_data.csize - 1);
+
+	kfree(cp);
+	cp = temp;
 	//memcpy(&cp, &page[i], 4);
 
 	// get from subblock_data
@@ -695,9 +703,10 @@ static int deserialize(char *page, struct tokunode *node)
 		m += data_size;
 
 		k = 0;
-		memcpy(&node->flags, &bufferd[k], 8);
+		k += 12;
+		memcpy(&node->flags, &bufferd[k], 4);
 
-		k += 8;
+		k += 4;
 		memcpy(&node->height, &bufferd[k], 4);
 
 #ifdef DEBUG
@@ -705,7 +714,7 @@ static int deserialize(char *page, struct tokunode *node)
 	printk("Node height of %u\n", node->height);
 #endif
 
-		k += 8;
+		k += 12;
 		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
 		if (node->n_children > 1){
 			k += fill_pivot(node->pivotkeys, &bufferd[k], node->n_children); 
@@ -717,7 +726,7 @@ static int deserialize(char *page, struct tokunode *node)
 		// Block nums
 		if (node->height > 0) {
 			for (l = 0; l < node->n_children; l++) {
-				memcpy(node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
+				memcpy(&node->pivotkeys->dbt_keys[l].blocknum, &bufferd[k], 4);
 				k += 4;
 #ifdef DEBUG
 	printk("CHILD_BLOCKNUM: %d\n", node->pivotkeys->dbt_keys[l].blocknum);
