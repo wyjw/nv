@@ -382,26 +382,33 @@ static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
 // blocktable
 static int register_block_table(struct nvme_ns *ns, struct block_table *bt)
 {
-	tctx->bt = bt;
+	tctx->bt->length_of_array = bt->length_of_array;
+	tctx->bt->smallest = bt->smallest;
+	tctx->bt->next_head = bt->next_head;
+	
 #ifdef DEBUG
-	printk(KERN_ERR "Length of array is: %lu \n", bt->length_of_array);
-	printk(KERN_ERR "Smallest element is: %u \n", bt->smallest);
-	printk(KERN_ERR "Next head is: %u \n", bt->next_head);	
+	printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
+	printk(KERN_ERR "Smallest element is: %u \n", tctx->bt->smallest);
+	printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);	
 #endif
 #ifdef DEBUG
 	int i = 0;
 	printk(KERN_ERR "PRINTING WHOLE BLOCK TABLE.\n");
+#endif
+
 	void * user_ptr;
 	user_ptr = bt->block_translation;
 	printk(KERN_ERR "USERSPACE ADDRESS IS %u.\n", user_ptr);
-	bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * bt->length_of_array, GFP_KERNEL);
-	copy_from_user(bt->block_translation, user_ptr, sizeof(struct block_translation_pair) * bt->length_of_array);
+	tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * bt->length_of_array, GFP_KERNEL);
+	copy_from_user(tctx->bt->block_translation, user_ptr, sizeof(struct block_translation_pair) * bt->length_of_array);
+
+#ifdef DEBUG
 	printk(KERN_ERR "Finish transferring.\n");
 	for (i = 0; i < bt->length_of_array; i++)
 	{
 		printk(KERN_ERR "For blocknum %u", i);
-		printk(KERN_ERR "OFFSET: %lu", bt->block_translation[i].u.diskoff);
-		printk(KERN_ERR "SIZE: %u", bt->block_translation[i].size);
+		printk(KERN_ERR "OFFSET: %llu", tctx->bt->block_translation[i].u.diskoff);
+		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
 	}
 #endif
 }
@@ -525,17 +532,46 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 		rq_for_each_segment(bvec, req, iter)
 		{
 			char *buffer = bio_data(req->bio);
+#ifdef DEBUG
 			printk(KERN_ERR "char bio: %s \n", buffer);
-			printk(KERN_ERR "char is: %c\n", buffer[2]);
-		
+			printk(KERN_ERR "char is: %c\n", buffer[2]);	
 			printk(KERN_ERR "size is: %u\n", req->bio->bi_iter.bi_size);
+#endif
 			// retry
 			int next_page;
 			next_page = page_match(buffer, 4096);
 			if (next_page == 0)
 				goto ERROR;
-			cmnd.rw.slba = cpu_to_le64(next_page);
-			printk(KERN_ERR "NEXT PAGE IS %u\n", cmnd.rw.slba);
+			if (!tctx->bt || !tctx->bt->block_translation)
+			{
+				printk(KERN_ERR "No block table when we want to do lookup.\n");
+				goto ERROR;
+			}
+			if (next_page > tctx->bt->length_of_array) {
+				printk(KERN_ERR "Does not fit!\n");
+				goto ERROR;
+			}
+#ifdef DEBUG
+			printk(KERN_ERR "NEXT PAGE IS %u\n", next_page);
+			printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
+			printk(KERN_ERR "Smallest element is: %u \n", tctx->bt->smallest);
+			printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);	
+			int i = 0;
+			for (i = 0; i < tctx->bt->length_of_array; i++)
+			{
+				printk(KERN_ERR "For blocknum %u", i);
+				printk(KERN_ERR "OFFSET: %llu", tctx->bt->block_translation[i].u.diskoff);
+				printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
+			}
+#endif
+			uint64_t next_offset;
+			next_offset = tctx->bt->block_translation[next_page].u.diskoff;
+
+#ifdef DEBUG
+			printk(KERN_ERR "The next offset is %llu\n", next_offset);
+#endif
+			// cmnd.rw.slba = cpu_to_le64(nvme_lba_to_sect(ns, next_offset));
+			cmnd.rw.slba = cpu_to_le64(next_offset / 512);
 			req->__sector = cmnd.rw.slba;
 			/*
 			if (buffer[a] == "a"){
@@ -552,7 +588,8 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 	else
 	{
 ERROR:
-		//printk(KERN_ERR "Final\n");
+		// just some final sanity check
+		printk(KERN_ERR "Final count is %u\n", req->alter_count);
 		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
 	}
@@ -930,8 +967,8 @@ static int __init treenvme_init(void)
 #ifdef DEBUG
 	printk(KERN_ERR "Got into original treenvme init. \n");
 #endif
-	tctx = kmalloc(sizeof(struct treenvme_ctx), GFP_NOWAIT);
-	tctx->bt = kmalloc(sizeof(struct block_table), GFP_NOWAIT);	
+	tctx = kmalloc(sizeof(struct treenvme_ctx), GFP_KERNEL);
+	tctx->bt = kmalloc(sizeof(struct block_table), GFP_KERNEL);	
 	
 	// this is how we keep the nodes in memory
 	node_cachep = KMEM_CACHE(tokunode, SLAB_HWCACHE_ALIGN | SLAB_PANIC);	
