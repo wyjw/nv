@@ -1,5 +1,7 @@
 // This is a key-data structure..
 
+#include <linux/hashtable.h>
+
 struct DBT {
 	void *data;		/* key value */
 	uint32_t size;		/* key/data length */
@@ -20,7 +22,38 @@ struct pivot_bounds {
 	struct DBT *dbt_keys;
 };
 
-struct ftnode_partition;
+struct block_data {
+	uint32_t start;
+	uint32_t end;
+	uint32_t size;
+};
+
+enum child_tag {
+	SUBBLOCK = 1,
+	BASEMENT = 2,
+};
+
+struct subblock_data {
+	void *ptr;
+	uint32_t csize; // compressed size
+	uint32_t usize; // uncompressed size
+};
+
+struct basement_data {
+	uint32_t le_offset;
+	uint8_t key[0];
+	struct hlist_node node;
+};
+
+struct child_node_data {
+	int blocknum;
+	union {
+		struct subblock_data *sublock;
+		struct basement_data *leaf;
+	} u;
+	enum child_tag tag;
+};
+
 struct ctpair;
 
 struct tokunode {
@@ -36,6 +69,47 @@ struct tokunode {
 	uint32_t fullhash;
 	int n_children;
 	struct pivot_bounds *pivotkeys;
-	struct ftnode_parititon *bp;
+	struct child_node_data *cnd;
 	struct ctpair *ct_pair;
+};
+
+typedef int (*comparator)(char *a, char *b, int asize, int bsize);
+
+enum search_direction {
+	LEFT_TO_RIGHT,
+	RIGHT_TO_LEFT
+};
+
+struct search_ctx {
+	comparator compare;
+	enum search_direction direction;
+       	const struct DBT *k;
+	void *user_data;
+	struct DBT *pivot_bound;	
+	const struct DBT *k_bound;
+};
+
+enum translation_type {
+	TRANSLATION_NONE = 0,
+	TRANSLATION_CURRENT,
+	TRANSLATION_INPROGRESS,
+	TRANSLATION_CHECKPOINTED,
+	TRANSLATION_DEBUG
+};
+
+struct block_translation_pair {
+	union {
+		uint64_t diskoff;
+		uint64_t free_blocknum;	
+	} u;
+
+	uint64_t size;
+};
+
+struct block_table {
+	enum translation_type type;
+	int64_t length_of_array;
+	int64_t smallest;
+	int64_t next_head;
+	struct block_translation_pair *block_translation; 
 };
