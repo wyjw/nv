@@ -2125,7 +2125,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 };
 #endif /* CONFIG_NVME_MULTIPATH */
 
-#ifdef CONFIG_TREENVME
+#ifdef CONFIG_NVME_TREENVME
 const struct block_device_operations treenvme_fops = {
 	.owner		= THIS_MODULE,
 	.open		= nvme_open,
@@ -2135,7 +2135,7 @@ const struct block_device_operations treenvme_fops = {
 	.getgeo		= nvme_getgeo,
 	.pr_ops		= &nvme_pr_ops,
 };
-#endif /* CONFIG_TREENVME */
+#endif /* CONFIG_NVME_TREENVME */
 
 static int nvme_wait_ready(struct nvme_ctrl *ctrl, u64 cap, bool enabled)
 {
@@ -3722,7 +3722,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
 	nvme_mpath_add_disk(ns, id);
 
-#ifdef CONFIG_TREENVME
+#ifdef CONFIG_NVME_TREENVME
 
 	/*	
 	// alter_tree

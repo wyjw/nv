@@ -418,7 +418,7 @@ struct treenvme_head {
 	spinlock_t		requeue_lock;
 	struct work_struct	requeue_work;
 	struct mutex		lock;
-#ifdef CONFIG_TREENVME
+#ifdef CONFIG_NVME_TREENVME
 	struct nvme_ns __rcu	*current_path[];
 #endif
 };
@@ -428,7 +428,7 @@ struct treenvme_ns {
 	struct nvme_ctrl *ctrl;
 	struct request_queue *queue;
 	struct gendisk *disk;
-#ifdef CONFIG_TREENVME
+#ifdef CONFIG_NVME_TREENVME
 	enum nvme_ana_state ana_state;
 	u32 ana_grpid;
 #endif
@@ -710,7 +710,7 @@ void nvme_set_queue_limits(struct nvme_ctrl *ctrl, struct request_queue *q);
 void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id); 
 int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd, void __user *ubuffer, unsigned bufflen, void __user *meta_buffer, unsigned meta_len, u32 meta_seed, u64 *result, unsigned timeout);
 
-#ifdef CONFIG_TREENVME
+#ifdef CONFIG_NVME_TREENVME
 void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags);
 int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);

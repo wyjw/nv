@@ -24,9 +24,10 @@ config NVME_MULTIPATH
 	   /dev/nvmeXnY device will show up for each NVMe namespaces,
 	   even if it is accessible through multiple controllers.
 
-config TREENVME
+config NVME_TREENVME
 	bool "treeNvme support"
-	depends on PCI && BLOCK && NVME_CORE
+	depends on PCI && BLOCK
+	select NVME_CORE
 	---help---
 	   This option allows for treenvme.
 
