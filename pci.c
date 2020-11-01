@@ -885,6 +885,7 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
 	struct nvme_command cmnd;
 	blk_status_t ret;
 
+#ifdef CONFIG_NVME_TREENVME
 	if (req->cmd_flags & REQ_TREENVME)
 	{
 		/*
@@ -935,6 +936,10 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
 		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
 	}
+#else
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		nvme_end_request(req, cqe->status, cqe->result);
+#endif
 	
 }
 

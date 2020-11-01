@@ -3723,7 +3723,6 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	nvme_mpath_add_disk(ns, id);
 
 #ifdef CONFIG_NVME_TREENVME
-
 	/*	
 	// alter_tree
 	printk(KERN_ERR "Got into treenvm creation.\n");

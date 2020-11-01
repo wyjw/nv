@@ -26,8 +26,7 @@ config NVME_MULTIPATH
 
 config NVME_TREENVME
 	bool "treeNvme support"
-	depends on PCI && BLOCK
-	select NVME_CORE
+	depends on PCI && BLOCK && NVME_CORE
 	---help---
 	   This option allows for treenvme.
 

@@ -380,19 +380,23 @@ static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
 }
 
 // blocktable
-static int register_block_table(struct nvme_ns *ns, struct block_table *bt)
+static int register_block_table(struct treenvme_block_table *bt)
 {
+	/*
+	// This is wrong.
 	tctx->bt->length_of_array = bt->length_of_array;
 	tctx->bt->smallest = bt->smallest;
 	tctx->bt->next_head = bt->next_head;
-	
+	*/
+	copy_from_user(&tctx->bt->length_of_array, &bt->length_of_array, sizeof(int64_t));
+	copy_from_user(&tctx->bt->smallest, &bt->smallest, sizeof(int64_t));
+	copy_from_user(&tctx->bt->next_head, &bt->next_head, sizeof(int64_t));
 #ifdef DEBUG
 	printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
 	printk(KERN_ERR "Smallest element is: %u \n", tctx->bt->smallest);
 	printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);	
 #endif
 #ifdef DEBUG
-	int i = 0;
 	printk(KERN_ERR "PRINTING WHOLE BLOCK TABLE.\n");
 #endif
 
@@ -402,13 +406,26 @@ static int register_block_table(struct nvme_ns *ns, struct block_table *bt)
 	tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * bt->length_of_array, GFP_KERNEL);
 	copy_from_user(tctx->bt->block_translation, user_ptr, sizeof(struct block_translation_pair) * bt->length_of_array);
 
+	int i = 0;
+	for (i = 0; i < bt->length_of_array; i++)
+	{	
+		if (!(tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE))
+		{
+			tctx->bt->block_translation[i].size = -1;
+			tctx->bt->block_translation[i].u.diskoff = -1;
+		}
+	}
 #ifdef DEBUG
 	printk(KERN_ERR "Finish transferring.\n");
 	for (i = 0; i < bt->length_of_array; i++)
 	{
-		printk(KERN_ERR "For blocknum %u", i);
-		printk(KERN_ERR "OFFSET: %llu", tctx->bt->block_translation[i].u.diskoff);
-		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
+		// free is a constant that tokudb uses to signify empty
+		if (tctx->bt->block_translation[i].size != -1)
+		{
+		printk(KERN_ERR "For blocknum %u", i);		
+		printk(KERN_ERR "OFFSET: %llx", tctx->bt->block_translation[i].u.diskoff);
+		printk(KERN_ERR "SIZE: %llx", tctx->bt->block_translation[i].size);
+		}
 	}
 #endif
 }
@@ -473,7 +490,7 @@ int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
 #ifdef DEBUG
 		printk(KERN_ERR "Attempt to register blocktable. \n");
 #endif
-		ret = register_block_table(ns, argp);
+		ret = register_block_table(argp);
 		break;
 	default:
 		if (ns->ndev)
@@ -559,14 +576,26 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 			int i = 0;
 			for (i = 0; i < tctx->bt->length_of_array; i++)
 			{
+				// Free is used to signify empty entry
+				if (tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE) {
 				printk(KERN_ERR "For blocknum %u", i);
 				printk(KERN_ERR "OFFSET: %llu", tctx->bt->block_translation[i].u.diskoff);
 				printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
+				}
 			}
 #endif
+			if (next_page >= tctx->bt->length_of_array)
+			{
+				printk(KERN_ERR "Page is not in block array.");
+				goto ERROR;
+			}
 			uint64_t next_offset;
 			next_offset = tctx->bt->block_translation[next_page].u.diskoff;
-
+			if (next_offset == -1) 
+			{
+				printk(KERN_ERR "Broken! Not right offset. ");
+				goto ERROR;
+			}
 #ifdef DEBUG
 			printk(KERN_ERR "The next offset is %llu\n", next_offset);
 #endif
@@ -973,7 +1002,7 @@ static int __init treenvme_init(void)
 	// this is how we keep the nodes in memory
 	node_cachep = KMEM_CACHE(tokunode, SLAB_HWCACHE_ALIGN | SLAB_PANIC);	
 
-	DECLARE_HASHTABLE(tbl, 4);
+	// DECLARE_HASHTABLE(tbl, 4);
 }
 
 static void __exit treenvme_exit(void)

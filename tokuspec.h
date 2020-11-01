@@ -2,6 +2,9 @@
 
 #include <linux/hashtable.h>
 
+//#define FREE 0xFFFFFFFFFFFFFFFF 
+#define FREE 0xFFFF000000000000
+
 struct DBT {
 	void *data;		/* key value */
 	uint32_t size;		/* key/data length */
@@ -97,10 +100,12 @@ enum translation_type {
 	TRANSLATION_DEBUG
 };
 
+struct block_struct { int64_t b; };
+
 struct block_translation_pair {
 	union {
 		uint64_t diskoff;
-		uint64_t free_blocknum;	
+		struct block_struct free_blocknum;	
 	} u;
 
 	uint64_t size;

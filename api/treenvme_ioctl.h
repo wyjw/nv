@@ -50,10 +50,12 @@ enum treenvme_translation_type {
 	TREENVME_TRANSLATION_DEBUG
 };
 
+struct treenvme_block_struct { int64_t b; };
+
 struct treenvme_block_translation_pair {
 	union {
 		uint64_t diskoff;
-		uint32_t free_blocknum;	
+		struct treenvme_block_struct free_blocknum;	
 	} u;
 
 	uint64_t size;
@@ -62,8 +64,8 @@ struct treenvme_block_translation_pair {
 struct treenvme_block_table {
 	enum treenvme_translation_type type;
 	int64_t length_of_array;
-	uint32_t smallest;
-	uint32_t next_head;
+	int64_t smallest;
+	int64_t next_head;
 	struct treenvme_block_translation_pair *block_translation; 
 };
 
