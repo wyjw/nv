@@ -15,12 +15,15 @@
 #include "nvme.h"
 #include "tokuspec.h"
 
-#define DEBUG 1
-//#define DEBUGMAX 0
+//#define DEBUG 1
+//#define DEBUGMAX 1
+#define DEBUGEX1 1
 
 // Hardcoded magic variables
 #define TREENVME_OFF_BLOCKTABLE 0ULL
 #define TREENVME_OFF_SQES	0x8000000ULL
+
+static int counter = 0;
 
 static bool depthpath = true;
 module_param(depthpath, bool, 0444);
@@ -47,8 +50,10 @@ struct treenvme_ctx {
 static struct treenvme_ctx *tctx;
 static const struct file_operations treenvme_ctrl_fops;
 static struct kmem_cache *node_cachep; 
-static int page_match(char *page, int page_size);
+static int page_match(struct request *rq, char *page, int page_size);
 static int treenvme_setup_ctx(struct nvme_ns *ns, void *argp);
+
+// MACROS
 
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags)
 {
@@ -382,6 +387,7 @@ static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
 // blocktable
 static int register_block_table(struct treenvme_block_table *bt)
 {
+	counter = 0;
 	/*
 	// This is wrong.
 	tctx->bt->length_of_array = bt->length_of_array;
@@ -400,11 +406,15 @@ static int register_block_table(struct treenvme_block_table *bt)
 	printk(KERN_ERR "PRINTING WHOLE BLOCK TABLE.\n");
 #endif
 
+	//void * user_ptr;
+	//user_ptr = bt->block_translation;
+#ifdef DEBUG
 	void * user_ptr;
 	user_ptr = bt->block_translation;
-	printk(KERN_ERR "USERSPACE ADDRESS IS %u.\n", user_ptr);
-	tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * bt->length_of_array, GFP_KERNEL);
-	copy_from_user(tctx->bt->block_translation, user_ptr, sizeof(struct block_translation_pair) * bt->length_of_array);
+	//printk(KERN_ERR "USERSPACE ADDRESS IS %u.\n", user_ptr);
+#endif
+	tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * tctx->bt->length_of_array, GFP_KERNEL);
+	copy_from_user(tctx->bt->block_translation, bt->block_translation, sizeof(struct block_translation_pair) * tctx->bt->length_of_array);
 
 	int i = 0;
 	for (i = 0; i < bt->length_of_array; i++)
@@ -420,11 +430,11 @@ static int register_block_table(struct treenvme_block_table *bt)
 	for (i = 0; i < bt->length_of_array; i++)
 	{
 		// free is a constant that tokudb uses to signify empty
-		if (tctx->bt->block_translation[i].size != -1)
+		if (tctx->bt->block_translation[i].size != -1 && tctx->bt->block_translation[i].size != 0)
 		{
 		printk(KERN_ERR "For blocknum %u", i);		
 		printk(KERN_ERR "OFFSET: %llx", tctx->bt->block_translation[i].u.diskoff);
-		printk(KERN_ERR "SIZE: %llx", tctx->bt->block_translation[i].size);
+		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
 		}
 	}
 #endif
@@ -511,7 +521,7 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
 	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
 }
 
-inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe)
+void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	//struct nvme_queue *nvmeq = iod->nvmeq;
@@ -519,10 +529,14 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 	struct nvme_dev *dev = iod->nvmeq->dev;
 	struct nvme_command cmnd;
 	blk_status_t ret;
-
+	counter++;
 	//printk(KERN_ERR "GOT HERE -- rebound \n");
-	if (req->alter_count < depthcount && !op_is_write(req_op(req)))
+	if (req->alter_count < req->total_count && !op_is_write(req_op(req)))
 	{
+#ifdef DEBUG
+		printk(KERN_ERR "alter count at: %u\n", req->alter_count);
+		printk(KERN_ERR "total count at: %u\n", req->total_count);
+#endif
 		req->alter_count += 1;
 		// alter
 		ret = nvme_setup_cmd(ns, req, &cmnd);
@@ -556,7 +570,7 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 #endif
 			// retry
 			int next_page;
-			next_page = page_match(buffer, 4096);
+			next_page = page_match(req, buffer, 4096);
 			if (next_page == 0)
 				goto ERROR;
 			if (!tctx->bt || !tctx->bt->block_translation)
@@ -568,16 +582,24 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 				printk(KERN_ERR "Does not fit!\n");
 				goto ERROR;
 			}
+			if (next_page == -2) {
+				// we have a resulting leaf node
+				goto LEAF;	
+			}
 #ifdef DEBUG
 			printk(KERN_ERR "NEXT PAGE IS %u\n", next_page);
 			printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
 			printk(KERN_ERR "Smallest element is: %u \n", tctx->bt->smallest);
-			printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);	
+			printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);
+
+#endif
+
+#ifdef DEBUGMAX	
 			int i = 0;
 			for (i = 0; i < tctx->bt->length_of_array; i++)
 			{
 				// Free is used to signify empty entry
-				if (tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE) {
+				if (tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE && tctx->bt->block_translation[i].size != 0) {
 				printk(KERN_ERR "For blocknum %u", i);
 				printk(KERN_ERR "OFFSET: %llu", tctx->bt->block_translation[i].u.diskoff);
 				printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
@@ -617,12 +639,24 @@ inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req
 	else
 	{
 ERROR:
+		/*
+		// What is going on here?
+		if (req->alter_count < depthcount && !op_is_write(req_op(req)))
+		{
+			req->alter_count = depthcount;
+		}
+		*/
 		// just some final sanity check
 		printk(KERN_ERR "Final count is %u\n", req->alter_count);
 		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
+		return;
+LEAF:
+	printk(KERN_ERR "Got to leaf in %u\n", req->__sector);
+	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+	nvme_end_request(req, cqe->status, cqe->result);
+	return;
 	}
-
 }
 
 void init_pivot(struct pivot_bounds *pb, int num) {
@@ -679,6 +713,7 @@ int fill_pivot(struct pivot_bounds *pb, char *page, int n)
 	return k;
 }
 
+// Reference: https://github.com/percona/PerconaFT/blob/8ff18ff1d135a8a5d6e745cf2c4dbf5684fcebd9/ft/bndata.cc#L176
 static int deserialize_basement(char *page, struct child_node_data *cnd) 
 {
 	int i = 0;
@@ -708,7 +743,6 @@ static int deserialize_basement(char *page, struct child_node_data *cnd)
 	printk(KERN_ERR "page val: %u\n", page[0]);
 #endif
 
-/*
 	memcpy(&key_data_size, &page[i], 4);
 	i += 8;
 
@@ -734,11 +768,10 @@ static int deserialize_basement(char *page, struct child_node_data *cnd)
 	char *bytes = kmalloc(sizeof(char) * key_data_size, GFP_KERNEL);
 	memcpy(&bytes, &page[i], key_data_size);
 	i += key_data_size;
-*/
 }
 
 // Reference: toku_deserialize_bp_from_disk
-static int deserialize(char *page, struct tokunode *node) 
+static int deserialize(struct request *req, char *page, struct tokunode *node) 
 {
 	struct block_data *bd;
 	// node->blocknum = blocknum;
@@ -746,13 +779,19 @@ static int deserialize(char *page, struct tokunode *node)
 	node->ct_pair = NULL;
 	int z = 0;
 
-#ifdef DEBUGMAX	
+#ifdef DEBUGMAX
 	for (z = 0; z < 512; z++){
 		if (page[z] != 0)
 		{
 			printk(KERN_ERR "we have %u @ %u", page[z], z);
 		}	
 	}
+#ifdef DEBUGEX1
+	printk(KERN_ERR "Stuff from Leaf Example 1:....... \n");
+	printk(KERN_ERR	"VAL_SIZE: 10\n");
+	printk(KERN_ERR "ELE_SIZE: 10\n");
+	printk(KERN_ERR "\n");
+#endif
 #endif
 
 	int i = 0;
@@ -848,7 +887,7 @@ static int deserialize(char *page, struct tokunode *node)
 
 	kfree(cp);
 	cp = temp;
-	//memcpy(&cp, &page[i], 4);
+	// memcpy(&cp, &page[i], 4);
 
 	// get from subblock_data
 	uint32_t data_size = 0;
@@ -859,11 +898,11 @@ static int deserialize(char *page, struct tokunode *node)
 	printk("DATA_SIZE: %u\n", data_size);
 #endif
 
-#ifdef DEBUG	
+#ifdef DEBUGMAX
 	for (z = 0; z < data_size; z++){
 		if (cp[z] != 0)
 		{
-			printk(KERN_ERR "we have %u @ %u in subblock", cp[z], z);
+			printk(KERN_ERR "we have %u @ %u in subblock\n", cp[z], z);
 		}	
 	}
 #endif
@@ -884,7 +923,16 @@ static int deserialize(char *page, struct tokunode *node)
 	printk("Node flags of %u\n", node->flags);
 	printk("Node height of %u\n", node->height);
 #endif
-
+		if (node->height > req->total_count) {
+			// safety feature
+			if (node->height > 16)
+			       req->total_count = 16;	
+			else
+			       req->total_count = node->height;
+#ifdef DEBUG
+	printk("Changed total count to %u\n", req->total_count);
+#endif
+		}
 		k += 12;
 		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
 		if (node->n_children > 1){
@@ -894,11 +942,13 @@ static int deserialize(char *page, struct tokunode *node)
 			init_pivot(node->pivotkeys, 0);
 		}
 
-		// puts into node stuff
-		node->cnd = kmalloc(sizeof(struct child_node_data) * node->n_children, GFP_KERNEL);
-
 		// Block nums
+#ifdef DEBUG
+	printk("NUMBER OF CHILDREN IS %d\n", node->n_children);
+#endif
 		if (node->height > 0) {
+			// puts into node stuff
+			node->cnd = kmalloc(sizeof(struct child_node_data) * node->n_children, GFP_KERNEL);
 			for (l = 0; l < node->n_children; l++) {
 				memcpy(&node->cnd[l].blocknum, &bufferd[k], 4);
 				k += 8;
@@ -908,15 +958,35 @@ static int deserialize(char *page, struct tokunode *node)
 			}
 		}
 		else {
+			// Gotten from: ?
+			// hopefully this magic number doesn't break things.	
+			// This is adding the uncompressed size
+			i += sb_data->csize;
+			i += 14;
+#ifdef DEBUG
+			printk("We are at counter %d\n", i);
+#endif
+			memcpy(&node->n_children, &page[i], 4);
+			i += 22;
+#ifdef DEBUG
+			printk("NUMBER OF CHILDREN IS %d\n", node->n_children);
+			printk("We are at counter %d\n", i);
+#endif
+			node->cnd = kmalloc(sizeof(struct child_node_data) * node->n_children, GFP_KERNEL);	
+			
+			// we have to re-do the pivot keys because number of children was wrong in first fill
+			// fill_pivot(node->pivotkeys, &page[i], node->n_children); 
+			// actually this does not work
+		
 			for (l = 0; l < node->n_children; l++) {
-				memcpy(&node->cnd[l].blocknum, &bufferd[k], 4);
-				k += 8;
+				memcpy(&node->cnd[l].blocknum, &page[i], 4);
+				i += 12;
 #ifdef DEBUG
 	printk("LEAF_CHILD_BLOCKNUM: %d\n", node->cnd[l].blocknum);
 #endif			
-				deserialize_basement(&bufferd[k], &node->cnd[l]);
+				//deserialize_basement(&bufferd[k], &node->cnd[l]);
 			}
-			return 0;
+			return -2;
 		}
 
 		return 1; 
@@ -944,14 +1014,19 @@ static int example_compare(char *a, char *b, int asize, int bsize)
 	return -1;	
 }
 
-static int page_match(char *page, int page_size)
+static int page_match(struct request *req, char *page, int page_size)
 {
 	struct tokunode *node = kmem_cache_alloc(node_cachep, GFP_KERNEL);
-
+	
+	int is_child = 0;
 	int result;
-	result = deserialize(page, node);
+	result = deserialize(req, page, node);
 	if (result == -1)
 		return -1;
+
+	// is this a leaf node?
+	if (result == -2)
+		is_child = 1;
 
 	int low = 0;
 	int high = node->n_children - 1;
@@ -960,21 +1035,27 @@ static int page_match(char *page, int page_size)
 	init_DBT(&pivot_key);
 
 	struct search_ctx *search = kmalloc(sizeof(struct search_ctx), GFP_KERNEL);
-	
-	// this is only a test?
-	search->compare = &example_compare;
-	while (low < high)
-	{
-		middle = (low + high) / 2;	
-		bool c = compare(search, &node->pivotkeys->dbt_keys[low], &node->pivotkeys->dbt_keys[high]);
-		if (((search->direction == LEFT_TO_RIGHT) && c) || (search->direction == RIGHT_TO_LEFT && !c))
-		{	
-			high = middle;
+
+	if (is_child == 0) {	
+		// this is only a test?
+		search->compare = &example_compare;
+		while (low < high)
+		{
+			middle = (low + high) / 2;	
+			bool c = compare(search, &node->pivotkeys->dbt_keys[low], &node->pivotkeys->dbt_keys[high]);
+			if (((search->direction == LEFT_TO_RIGHT) && c) || (search->direction == RIGHT_TO_LEFT && !c))
+			{	
+				high = middle;
+			}
+			else {
+				low = middle + 1;
+			}
+			break;		
 		}
-		else {
-			low = middle + 1;
-		}
-		break;		
+	}
+	else {
+		// This means that we are dealing with a leaf node.
+		return -2;
 	}
 #ifdef DEBUG
 	if (!node)

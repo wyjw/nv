@@ -3,8 +3,8 @@
 #include <linux/hashtable.h>
 
 //#define FREE 0xFFFFFFFFFFFFFFFF 
-#define FREE 0xFFFF000000000000
-
+//#define FREE 0xFFFF000000000000
+#define FREE 0x500000
 struct DBT {
 	void *data;		/* key value */
 	uint32_t size;		/* key/data length */
@@ -114,7 +114,7 @@ struct block_translation_pair {
 struct block_table {
 	enum translation_type type;
 	int64_t length_of_array;
-	int64_t smallest;
-	int64_t next_head;
+	struct block_struct smallest;
+	struct block_struct next_head;
 	struct block_translation_pair *block_translation; 
 };

@@ -64,8 +64,8 @@ struct treenvme_block_translation_pair {
 struct treenvme_block_table {
 	enum treenvme_translation_type type;
 	int64_t length_of_array;
-	int64_t smallest;
-	int64_t next_head;
+	struct treenvme_block_struct smallest;
+	struct treenvme_block_struct next_head;
 	struct treenvme_block_translation_pair *block_translation; 
 };
 
