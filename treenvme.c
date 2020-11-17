@@ -17,7 +17,8 @@
 
 //#define DEBUG 1
 //#define DEBUGMAX 1
-#define DEBUGEX1 1
+//#define DEBUGEX1 1
+//#define TIME 1
 
 // Hardcoded magic variables
 #define TREENVME_OFF_BLOCKTABLE 0ULL
@@ -385,7 +386,7 @@ static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
 }
 
 // blocktable
-static int register_block_table(struct treenvme_block_table *bt)
+static int register_block_table(struct treenvme_block_table __user *bt)
 {
 	counter = 0;
 	/*
@@ -413,12 +414,22 @@ static int register_block_table(struct treenvme_block_table *bt)
 	user_ptr = bt->block_translation;
 	//printk(KERN_ERR "USERSPACE ADDRESS IS %u.\n", user_ptr);
 #endif
-	tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair)) * tctx->bt->length_of_array, GFP_KERNEL);
-	copy_from_user(tctx->bt->block_translation, bt->block_translation, sizeof(struct block_translation_pair) * tctx->bt->length_of_array);
-
+	struct block_translation_pair *new_bp;
+	new_bp = kmalloc(sizeof(struct block_translation_pair *), GFP_KERNEL);
+	//tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair *)), GFP_KERNEL);
+	//copy_from_user(&tctx->bt->block_translation, &bt->block_translation, sizeof(struct block_translation_pair *));	
+	copy_from_user(&new_bp, &bt->block_translation, sizeof(struct block_translation_pair *));
+		
+	tctx->bt->block_translation = kmalloc(sizeof(struct block_translation_pair) * tctx->bt->length_of_array, GFP_KERNEL);
 	int i = 0;
-	for (i = 0; i < bt->length_of_array; i++)
-	{	
+	for (i = 0; i < tctx->bt->length_of_array; i++)
+	{
+		copy_from_user(&tctx->bt->block_translation[i], &new_bp[i], sizeof(struct block_translation_pair));
+#ifdef DEBUGMAX
+		printk(KERN_ERR "For blocknum %u", i);		
+		printk(KERN_ERR "OFFSET: %llx", tctx->bt->block_translation[i].u.diskoff);
+		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
+#endif	
 		if (!(tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE))
 		{
 			tctx->bt->block_translation[i].size = -1;
@@ -427,7 +438,7 @@ static int register_block_table(struct treenvme_block_table *bt)
 	}
 #ifdef DEBUG
 	printk(KERN_ERR "Finish transferring.\n");
-	for (i = 0; i < bt->length_of_array; i++)
+	for (i = 0; i < tctx->bt->length_of_array; i++)
 	{
 		// free is a constant that tokudb uses to signify empty
 		if (tctx->bt->block_translation[i].size != -1 && tctx->bt->block_translation[i].size != 0)
@@ -569,8 +580,14 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 			printk(KERN_ERR "size is: %u\n", req->bio->bi_iter.bi_size);
 #endif
 			// retry
+#ifdef TIME
+			uint64_t time = ktime_get_ns();
+#endif
 			int next_page;
 			next_page = page_match(req, buffer, 4096);
+#ifdef TIME
+			printk("Time of %llu\n", ktime_get_ns() - time);
+#endif
 			if (next_page == 0)
 				goto ERROR;
 			if (!tctx->bt || !tctx->bt->block_translation)
@@ -1020,7 +1037,13 @@ static int page_match(struct request *req, char *page, int page_size)
 	
 	int is_child = 0;
 	int result;
+#ifdef TIME
+	uint64_t dstime = ktime_get_ns();
+#endif
 	result = deserialize(req, page, node);
+#ifdef TIME
+	printk(KERN_ERR "Deserialize time: %llu\n", ktime_get_ns() - dstime);
+#endif
 	if (result == -1)
 		return -1;
 
