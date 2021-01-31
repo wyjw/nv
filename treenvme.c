@@ -14,8 +14,9 @@
 #include <trace/events/block.h>
 #include "nvme.h"
 #include "tokuspec.h"
+#include "dbin.h"
 
-//#define DEBUG 1
+#define DEBUG 1
 //#define DEBUGMAX 1
 //#define DEBUGEX1 1
 //#define TIME 1
@@ -53,8 +54,6 @@ static const struct file_operations treenvme_ctrl_fops;
 static struct kmem_cache *node_cachep; 
 static int page_match(struct request *rq, char *page, int page_size);
 static int treenvme_setup_ctx(struct nvme_ns *ns, void *argp);
-
-// MACROS
 
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags)
 {
@@ -532,6 +531,12 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
 	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
 }
 
+/*
+char *pass_leaf_to_user() {
+	
+}
+*/
+
 void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
@@ -671,11 +676,13 @@ ERROR:
 LEAF:
 	printk(KERN_ERR "Got to leaf in %u\n", req->__sector);
 	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+	//pass_leaf_to_user();
 	nvme_end_request(req, cqe->status, cqe->result);
 	return;
 	}
 }
 
+/*
 void init_pivot(struct pivot_bounds *pb, int num) {
 	pb->num_pivots = num;
 	pb->total_size = 0;
@@ -879,13 +886,7 @@ static int deserialize(struct request *req, char *page, struct tokunode *node)
 
 	// uncompressed size
 	memcpy(&sb_data->usize, &page[i], 4);
-	i += 4;	
-	/*
-	for (j = 0; i < 400; j++) {
-		memcpy(&sb_data.usize, &page[i], 4);
-		i += 4;
-	}
-	*/
+	i += 4;
 
 #ifdef DEBUG
 	printk("COMPRESSED_SIZE: %u\n", sb_data->csize);
@@ -1093,6 +1094,442 @@ static int page_match(struct request *req, char *page, int page_size)
 	{
 		return 0;
 	}
+}
+*/
+
+static int
+ft_search_node_cutdown (
+    FT_HANDLE ft_handle,
+    struct _ftnode *node,
+    ft_search *search,
+    int child_to_search,
+    FT_GET_CALLBACK_FUNCTION getf,
+    void *getf_v,
+    bool *doprefetch,
+    FT_CURSOR ftcursor,
+    UNLOCKERS unlockers,
+    struct _ancestors *ans,
+    const pivot_bounds &bounds,
+    bool can_bulk_fetch
+    );
+
+static int page_match(struct request *req, char *page, int page_size)
+{
+	struct _ftnode *_node = NULL;
+	CACHEKEY root_key;
+	toku_calculate_root_offset_pointer(ft, &root_key, &fullhash);
+	_CACHEKEY new_key = { .b = root_key.b };
+	toku_pin_ftnode_cutdown(
+		ft,
+		new_key,
+		fullhash,
+		&bfe,
+		PL_READ,
+		&_node,
+		true
+		);
+
+	uint tree_height = _node->height + 1;
+
+	struct unlock_ftnode_extra unlock_extra = { ft_handle, node, false };
+	struct unlockers unlockers = { true, unlock_ftnode_fun, (void*)&unlock_extra, (UNLOCKERS)NULL};
+
+	{
+		bool doprefetch = false;
+			
+		//static int counter = 0;         counter++;
+		r = ft_search_node_cutdown(ft_handle, _node, search, bfe.child_to_read, getf, getf_v, &doprefetch, ftcursor, &unlockers, (struct _ancestors*)NULL, pivot_bounds::infinite_bounds(), can_bulk_fetch);
+		if (r==TOKUDB_TRY_AGAIN) {
+		    // there are two cases where we get TOKUDB_TRY_AGAIN
+		    //  case 1 is when some later call to toku_pin_ftnode returned
+		    //  that value and unpinned all the nodes anyway. case 2
+		    //  is when ft_search_node had to stop its search because
+		    //  some piece of a node that it needed was not in memory.
+		    //  In this case, the node was not unpinned, so we unpin it here
+		    if (unlockers.locked) {
+			toku_unpin_ftnode_read_only_cutdown(ft_handle->ft, _node);
+		    }
+		    goto try_again;
+		} else {
+		    assert(unlockers.locked);
+		}
+	    }
+
+	    assert(unlockers.locked);
+	    toku_unpin_ftnode_read_only_cutdown(ft_handle->ft, _node);
+	}
+
+}
+
+static int
+ft_search_node_cutdown(
+    FT_HANDLE ft_handle,
+    struct _ftnode *node,
+    ft_search *search,
+    int child_to_search,
+    FT_GET_CALLBACK_FUNCTION getf,
+    void *getf_v,
+    bool *doprefetch,
+    FT_CURSOR ftcursor,
+    UNLOCKERS unlockers,
+    struct _ancestors *ancestors,
+    const pivot_bounds &bounds,
+    bool can_bulk_fetch
+    )
+{
+    int r = 0;
+    invariant(child_to_search >= 0);
+    invariant(child_to_search < node->n_children);
+    //assert(BP_STATE(node,child_to_search) == PT_AVAIL);
+    const pivot_bounds next_bounds = bounds.next_bounds(cast_from__ftnode(node), child_to_search);
+    if (node->height > 0) {
+        r = ft_search_child_cutdown(
+            ft_handle,
+            node,
+            child_to_search,
+            search,
+            getf,
+            getf_v,
+            doprefetch,
+            ftcursor,
+            unlockers,
+            ancestors,
+            next_bounds,
+            can_bulk_fetch
+            );
+    }
+    else {
+	// return basementnode 
+        r = ft_search_basement_node_cutdown(
+            BLB(cast_from__ftnode(node), child_to_search),
+            search,
+            getf,
+            getf_v,
+            doprefetch,
+            ftcursor,
+            can_bulk_fetch
+            );
+    }
+    if (r == 0) {
+        return r; //Success
+    }
+
+    if (r != DB_NOTFOUND) {
+        return r; //Error (or message to quit early, such as TOKUDB_FOUND_BUT_REJECTED or TOKUDB_TRY_AGAIN)
+    }
+    // not really necessary, just put this here so that reading the
+    // code becomes simpler. The point is at this point in the code,
+    // we know that we got DB_NOTFOUND and we have to continue
+    assert(r == DB_NOTFOUND);
+    // we have a new pivotkey
+    if (node->height == 0) {
+        // when we run off the end of a basement, try to lock the range up to the pivot. solves #3529
+        const DBT *pivot = search->direction == FT_SEARCH_LEFT ? next_bounds.ubi() : // left -> right
+                                                                 next_bounds.lbe();  // right -> left
+        if (pivot != nullptr) {
+            int rr = getf(pivot->size, pivot->data, 0, nullptr, getf_v, true);
+            if (rr != 0) {
+                return rr; // lock was not granted
+            }
+        }
+    }
+}
+
+/* search in a node's child */
+static int
+ft_search_child_cutdown(FT_HANDLE ft_handle, struct _ftnode *node, int childnum, ft_search *search, FT_GET_CALLBACK_FUNCTION getf, void *getf_v, bool *doprefetch, FT_CURSOR ftcursor, UNLOCKERS unlockers, struct _ancestors *ancestors, const pivot_bounds &bounds, bool can_bulk_fetch)
+// Effect: Search in a node's child.  Searches are read-only now (at least as far as the hardcopy is concerned).
+{
+    struct _ancestors next_ancestors = {node, childnum, ancestors};
+
+    _BLOCKNUM childblocknum = BP_BLOCKNUM(node,childnum);
+    uint32_t fullhash = compute_child_fullhash_cutdown(ft_handle->ft->cf, node, childnum);
+    struct _ftnode *childnode = nullptr;
+
+    // If the current node's height is greater than 1, then its child is an internal node.
+    // Therefore, to warm the cache better (#5798), we want to read all the partitions off disk in one shot.
+    bool read_all_partitions = node->height > 1;
+    ftnode_fetch_extra bfe;
+    bfe.create_for_subset_read(
+        ft_handle->ft,
+        search,
+        &ftcursor->range_lock_left_key,
+        &ftcursor->range_lock_right_key,
+        ftcursor->left_is_neg_infty,
+        ftcursor->right_is_pos_infty,
+        ftcursor->disable_prefetching,
+        read_all_partitions
+        );
+    bool msgs_applied = false;
+    {
+        int rr = toku_pin_ftnode_for_query(ft_handle, *(BLOCKNUM *)&childblocknum, fullhash,
+                                         unlockers,
+                                         (ANCESTORS)&next_ancestors, bounds,
+                                         &bfe,
+                                         true,
+                                         (FTNODE *)&childnode,
+                                         &msgs_applied);
+        if (rr==TOKUDB_TRY_AGAIN) {
+            return rr;
+        }
+        invariant_zero(rr);
+    }
+
+    struct unlock_ftnode_extra unlock_extra = { ft_handle, cast_from__ftnode(childnode), msgs_applied };
+    struct unlockers next_unlockers = { true, unlock_ftnode_fun, (void *) &unlock_extra, unlockers };
+    int r = ft_search_node_cutdown(ft_handle, childnode, search, bfe.child_to_read, getf, getf_v, doprefetch, ftcursor, &next_unlockers, &next_ancestors, bounds, can_bulk_fetch);
+    if (r!=TOKUDB_TRY_AGAIN) {
+        // maybe prefetch the next child
+        //if (r == 0 && node->height == 1) {
+        //    ft_node_maybe_prefetch(ft_handle, cast_from__ftnode(node), childnum, ftcursor, doprefetch);
+        //}
+
+        assert(next_unlockers.locked);
+        if (msgs_applied) {
+            toku_unpin_ftnode(ft_handle->ft, cast_from__ftnode(childnode));
+        }
+        else {
+            toku_unpin_ftnode_read_only(ft_handle->ft, cast_from__ftnode(childnode));
+        }
+    } else {
+        // try again.
+
+        // there are two cases where we get TOKUDB_TRY_AGAIN
+        //  case 1 is when some later call to toku_pin_ftnode returned
+        //  that value and unpinned all the nodes anyway. case 2
+        //  is when ft_search_node had to stop its search because
+        //  some piece of a node that it needed was not in memory. In this case,
+        //  the node was not unpinned, so we unpin it here
+        if (next_unlockers.locked) {
+            if (msgs_applied) {
+                toku_unpin_ftnode(ft_handle->ft, cast_from__ftnode(childnode));
+            }
+            else {
+                toku_unpin_ftnode_read_only(ft_handle->ft, cast_from__ftnode(childnode));
+            }
+        }
+    }
+
+    return r;
+}
+
+int
+toku_pin_ftnode_for_query(
+    FT_HANDLE ft_handle,
+    BLOCKNUM blocknum,
+    uint32_t fullhash,
+    UNLOCKERS unlockers,
+    ANCESTORS ancestors,
+    const pivot_bounds &bounds,
+    ftnode_fetch_extra *bfe,
+    bool apply_ancestor_messages, // this bool is probably temporary, for #3972, once we know how range query estimates work, will revisit this
+    FTNODE *node_p,
+    bool* msgs_applied)
+{
+    void *node_v;
+    *msgs_applied = false;
+    FTNODE node = nullptr;
+    MSN max_msn_in_path = ZERO_MSN;
+    bool needs_ancestors_messages = false;
+    // this function assumes that if you want ancestor messages applied,
+    // you are doing a read for a query. This is so we can make some optimizations
+    // below.
+    if (apply_ancestor_messages) {
+        paranoid_invariant(bfe->type == ftnode_fetch_subset);
+    }
+    
+    int r = toku_cachetable_get_and_pin_nonblocking(
+            ft_handle->ft->cf,
+            blocknum,
+            fullhash,
+            &node_v,
+            get_write_callbacks_for_node(ft_handle->ft),
+            toku_ftnode_fetch_callback,
+            toku_ftnode_pf_req_callback,
+            toku_ftnode_pf_callback,
+            PL_READ,
+            bfe, //read_extraargs
+            unlockers);
+    if (r != 0) {
+        assert(r == TOKUDB_TRY_AGAIN); // Any other error and we should bomb out ASAP.
+        goto exit;
+    }
+    node = static_cast<FTNODE>(node_v);
+    if (apply_ancestor_messages && node->height == 0) {
+        needs_ancestors_messages = toku_ft_leaf_needs_ancestors_messages(
+            ft_handle->ft, 
+            node, 
+            ancestors, 
+            bounds, 
+            &max_msn_in_path, 
+            bfe->child_to_read
+            );
+        if (needs_ancestors_messages) {
+            toku::context apply_messages_ctx(CTX_MESSAGE_APPLICATION);
+
+            toku_unpin_ftnode_read_only(ft_handle->ft, node);
+            int rr = toku_cachetable_get_and_pin_nonblocking(
+                 ft_handle->ft->cf,
+                 blocknum,
+                 fullhash,
+                 &node_v,
+                 get_write_callbacks_for_node(ft_handle->ft),
+                 toku_ftnode_fetch_callback,
+                 toku_ftnode_pf_req_callback,
+                 toku_ftnode_pf_callback,
+                 PL_WRITE_CHEAP,
+                 bfe, //read_extraargs
+                 unlockers);
+            if (rr != 0) {
+                assert(rr == TOKUDB_TRY_AGAIN);
+                r = TOKUDB_TRY_AGAIN;
+                goto exit;
+            }
+            node = static_cast<FTNODE>(node_v);
+            toku_apply_ancestors_messages_to_node(
+                ft_handle, 
+                node, 
+                ancestors, 
+                bounds, 
+                msgs_applied,
+                bfe->child_to_read
+                );
+        } else {
+            if (!node->dirty()) {
+                toku_ft_bn_update_max_msn(node, max_msn_in_path, bfe->child_to_read);
+            }
+        }
+    }
+    *node_p = node;
+exit:
+    return r;
+}
+
+int toku_cachetable_get_and_pin_nonblocking(
+    CACHEFILE cf,
+    CACHEKEY key,
+    uint32_t fullhash,
+    void**value,
+    CACHETABLE_WRITE_CALLBACK write_callback,
+    CACHETABLE_FETCH_CALLBACK fetch_callback,
+    CACHETABLE_PARTIAL_FETCH_REQUIRED_CALLBACK pf_req_callback,
+    CACHETABLE_PARTIAL_FETCH_CALLBACK pf_callback,
+    pair_lock_type lock_type,
+    void *read_extraargs,
+    UNLOCKERS unlockers
+    )
+// See cachetable/cachetable.h.
+{
+    CACHETABLE ct = cf->cachetable;
+    assert(lock_type == PL_READ ||
+        lock_type == PL_WRITE_CHEAP ||
+        lock_type == PL_WRITE_EXPENSIVE
+        );
+try_again:
+    ct->list.pair_lock_by_fullhash(fullhash);
+    PAIR p = ct->list.find_pair(cf, key, fullhash);
+    if (p == NULL) {
+        toku::context fetch_ctx(CTX_FULL_FETCH);
+
+        // Not found
+        ct->list.pair_unlock_by_fullhash(fullhash);
+        ct->list.write_list_lock();
+        ct->list.pair_lock_by_fullhash(fullhash);
+        p = ct->list.find_pair(cf, key, fullhash);
+        if (p != NULL) {
+            // we just did another search with the write list lock and 
+            // found the pair this means that in between our 
+            // releasing the read list lock and grabbing the write list lock,
+            // another thread snuck in and inserted the PAIR into
+            // the cachetable. For simplicity, we just return
+            // to the top and restart the function
+            ct->list.write_list_unlock();
+            ct->list.pair_unlock_by_fullhash(fullhash);
+            goto try_again;
+        }
+
+        p = cachetable_insert_at(
+            ct,
+            cf,
+            key,
+            zero_value,
+            fullhash,
+            zero_attr,
+            write_callback,
+            CACHETABLE_CLEAN
+            );
+        assert(p);
+        // grab expensive write lock, because we are about to do a fetch
+        // off disk
+        // No one can access this pair because
+        // we hold the write list lock and we just injected
+        // the pair into the cachetable. Therefore, this lock acquisition
+        // will not block.
+        p->value_rwlock.write_lock(true);
+        pair_unlock(p);
+        run_unlockers(unlockers); // we hold the write list_lock.
+        ct->list.write_list_unlock();
+
+        // at this point, only the pair is pinned,
+        // and no pair mutex held, and 
+        // no list lock is held
+        uint64_t t0 = get_tnow();
+        cachetable_fetch_pair(ct, cf, p, fetch_callback, read_extraargs, false);
+        cachetable_miss++;
+        cachetable_misstime += get_tnow() - t0;
+
+        if (ct->ev.should_client_thread_sleep()) {
+            ct->ev.wait_for_cache_pressure_to_subside();
+        }
+        if (ct->ev.should_client_wake_eviction_thread()) {
+            ct->ev.signal_eviction_thread();
+        }
+
+        return TOKUDB_TRY_AGAIN;
+    }
+}
+
+static void cachetable_fetch_pair(
+    CACHETABLE ct, 
+    CACHEFILE cf, 
+    PAIR p, 
+    CACHETABLE_FETCH_CALLBACK fetch_callback, 
+    void* read_extraargs,
+    bool keep_pair_locked
+    ) 
+{
+    // helgrind
+    CACHEKEY key = p->key;
+    uint32_t fullhash = p->fullhash;
+
+    void *toku_value = NULL;
+    void *disk_data = NULL;
+    PAIR_ATTR attr;
+    
+    // FIXME this should be enum cachetable_dirty, right?
+    int dirty = 0;
+
+    pair_lock(p);
+    nb_mutex_lock(&p->disk_nb_mutex, p->mutex);
+    pair_unlock(p);
+
+    int r;
+    r = fetch_callback(cf, p, cf->fd, key, fullhash, &toku_value, &disk_data, &attr, &dirty, read_extraargs);
+    if (dirty) {
+        p->dirty = CACHETABLE_DIRTY;
+    }
+    assert(r == 0);
+
+    p->value_data = toku_value;
+    p->disk_data = disk_data;
+    p->attr = attr;
+    ct->ev.add_pair_attr(attr);
+    pair_lock(p);
+    nb_mutex_unlock(&p->disk_nb_mutex);
+    if (!keep_pair_locked) {
+        p->value_rwlock.write_unlock();
+    }
+    pair_unlock(p);
 }
 
 static int __init treenvme_init(void)

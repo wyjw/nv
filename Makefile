@@ -8,7 +8,7 @@ obj-$(CONFIG_NVME_FABRICS)		+= nvme-fabrics.o
 obj-$(CONFIG_NVME_RDMA)			+= nvme-rdma.o
 obj-$(CONFIG_NVME_FC)			+= nvme-fc.o
 obj-$(CONFIG_NVME_TCP)			+= nvme-tcp.o
-obj-$(CONFIG_NVME_TREENVME)		+= nvme-treenvme.o
+obj-$(CONFIG_NVME_TREENVME)		+= nvme-treenvme.o dbin.o
 
 nvme-core-y				:= core.o
 nvme-core-$(CONFIG_TRACING)		+= trace.o
