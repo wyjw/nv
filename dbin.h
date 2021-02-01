@@ -10,7 +10,7 @@
 #include <linux/ctype.h>
 
 //#include <pthread.h>
-#define printk printf
+//#define printk printf
 
 // node stuff
 // preliminaries for node
@@ -85,6 +85,13 @@ typedef char _Bytef;
 typedef unsigned long int _uLongf;
 
 void *_mmalloc(int size);
+
+#define _cast_voidp(name, val) name = (__typeof__(name))val
+#define MMALLOC(v) _cast_voidp(v, _mmalloc(sizeof(*v)))
+#define MMALLOC_N(n,v) _cast_voidp(v, _mmalloc((n)*sizeof(*v)))
+#define _BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
+#define _BP_STATE(node,i) ((node)->bp[i].state)
+#define _BP_WORKDONE(node,i) ((node)->bp[i].workdone)
 struct _sub_block {
 	void *uncompressed_ptr;
 	uint32_t uncompressed_size;
@@ -199,6 +206,8 @@ struct _comparator{
 	_compare_func _cmp;
 	uint8_t _memcpy_magic;
 };
+
+inline void init_comparator (struct _comparator *cmp); 
 
 /*void _convert_dbt_to_tokudbt(DBT *a, struct _dbt *b) {
 	a->data = b->data;
@@ -322,7 +331,8 @@ struct _mutex_t {
 
 // This is broken
 struct _cond_t {	
-	pthread_cond_t pcond;
+	int pcond;
+	//pthread_cond_t pcond;
 };
 
 struct _mutex_aligned {
@@ -411,7 +421,7 @@ struct _frwlock {
 	bool m_current_writer_expensive;
 	bool m_read_wait_experience;
 	int m_current_writer_tid;
-	struct _context_id m_blocking_writer_context_id;
+	enum _context_id m_blocking_writer_context_id;
 	struct queue_item m_queue_item_read;
 	bool m_wait_read_is_in_queue;
 	struct _cond_t m_wait_read;
@@ -526,5 +536,70 @@ struct _ctpair {
     _PAIR cf_prev;
 };
 
+inline void _rbuf_init(struct rbuf *r, unsigned char *buf, unsigned int size);
+unsigned int _rbuf_int (struct rbuf *r);
+inline void _rbuf_literal_bytes(struct rbuf *r, const void **bytes, unsigned int n_bytes);
+inline void _rbuf_MSN(struct rbuf *r);
+
+#define BP_START(node_dd,i) ((node_dd)[i].start)
+#define BP_SIZE(node_dd,i) ((node_dd)[i].size)
+#define BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
+#define BP_STATE(node,i) ((node)->bp[i].state)
+#define BP_WORKDONE(node, i)((node)->bp[i].workdone)
+#define BP_TOUCH_CLOCK(node, i) ((node)->bp[i].clock_count = 1)
+#define BP_SWEEP_CLOCK(node, i) ((node)->bp[i].clock_count = 0)
+#define BP_SHOULD_EVICT(node, i) ((node)->bp[i].clock_count == 0)
+#define BP_INIT_TOUCHED_CLOCK(node, i) ((node)->bp[i].clock_count = 1)
+#define BP_INIT_UNTOUCHED_CLOCK(node, i) ((node)->bp[i].clock_count = 0)
+#define BLB_MAX_MSN_APPLIED(node,i) (BLB(node,i)->max_msn_applied) 
+#define BLB_MAX_DSN_APPLIED(node,i) (BLB(node,i)->max_dsn_applied)
+#define BLB_DATA(node,i) (&(BLB(node,i)->data_buffer))
+#define BLB_NBYTESINDATA(node,i) (BLB_DATA(node,i)->get_disk_size())
+#define BLB_SEQINSERT(node,i) (BLB(node,i)->seqinsert)
+#define BLB_LRD(node, i) (BLB(node,i)->logical_rows_delta)
+
 //inline void set_BNC_cutdown(struct _ftnode *node, int i, 
+
+#define FT_LAYOUT_VERSION_14 14 
+
+struct ftnode_disk_data {
+	uint32_t start;
+	uint32_t size;
+};
+
+typedef struct ftnode_disk_data *FTNODE_DISK_DATA;
+
+enum ftnode_fetch_type {
+	ftnode_fetch_none = 1,
+	ftnode_fetch_subset,
+	ftnode_fetch_prefetch,
+	ftnode_fetch_all,
+	ftnode_fetch_keymatch,	
+};
+
+struct ftnode_fetch_extra {
+	uint8_t ft;
+	enum ftnode_fetch_type type;
+	struct _ft_search *search;
+	struct _dbt range_lock_left_key, range_lock_right_key;
+	bool left_is_neg_infty, right_is_pos_infty;
+	bool disable_prefetching;
+	int child_to_read;
+	bool read_all_partitions;
+	uint64_t bytes_read;
+	uint64_t io_time;
+	uint64_t decompress_time;
+	uint64_t deserialize_time;
+};
+
+int leftmost_child_wanted(struct ftnode_fetch_extra *ffe, struct _ftnode *node);
+int rightmost_child_wanted(struct ftnode_fetch_extra *ffe, struct _ftnode *node);
+
+int _search_which_child(struct _comparator *cmp, struct _ftnode *node, struct _ft_search *search);
+
+inline void set_BSB(struct _ftnode *node, int i, struct _sub_block *sb); 
+inline struct _sub_block *BSB(struct _ftnode *node, int i); 
+
+void init_ffe(struct ftnode_fetch_extra *fe);
+
 #endif /* DBIN_H */

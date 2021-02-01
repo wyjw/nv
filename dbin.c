@@ -1,38 +1,43 @@
 #include "dbin.h"
-#include "include/linux/string.h"
+#include <linux/string.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
 
 #ifndef RBUF
 // rbuf methods
-static unsigned int _rbuf_int (struct rbuf *r) {
+unsigned int _rbuf_int (struct rbuf *r) {
     //assert(r->ndone+4 <= r->size);
     uint32_t result = (*(uint32_t*)(r->buf+r->ndone));
     r->ndone+=4;
     return result;
 }
 
-static inline void _rbuf_literal_bytes (struct rbuf *r, const void **bytes, unsigned int n_bytes) {
+inline void _rbuf_literal_bytes (struct rbuf *r, const void **bytes, unsigned int n_bytes) {
     *bytes =   &r->buf[r->ndone];
     r->ndone+=n_bytes;
     //assert(r->ndone<=r->size);
 }
+
+inline void _rbuf_init(struct rbuf *r, unsigned char *buf, unsigned int size) {
+    r->buf = buf;
+    r->size = size;
+    r->ndone = 0;
+}
+
 #endif
 
-#define BP_START(node_dd,i) ((node_dd)[i].start)
-#define BP_SIZE(node_dd,i) ((node_dd)[i].size)
-#define BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
-#define BP_STATE(node,i) ((node)->bp[i].state)
-#define BP_WORKDONE(node, i)((node)->bp[i].workdone)
-#define BP_TOUCH_CLOCK(node, i) ((node)->bp[i].clock_count = 1)
-#define BP_SWEEP_CLOCK(node, i) ((node)->bp[i].clock_count = 0)
-#define BP_SHOULD_EVICT(node, i) ((node)->bp[i].clock_count == 0)
-#define BP_INIT_TOUCHED_CLOCK(node, i) ((node)->bp[i].clock_count = 1)
-#define BP_INIT_UNTOUCHED_CLOCK(node, i) ((node)->bp[i].clock_count = 0)
-#define BLB_MAX_MSN_APPLIED(node,i) (BLB(node,i)->max_msn_applied)
-#define BLB_MAX_DSN_APPLIED(node,i) (BLB(node,i)->max_dsn_applied)
-#define BLB_DATA(node,i) (&(BLB(node,i)->data_buffer))
-#define BLB_NBYTESINDATA(node,i) (BLB_DATA(node,i)->get_disk_size())
-#define BLB_SEQINSERT(node,i) (BLB(node,i)->seqinsert)
-#define BLB_LRD(node, i) (BLB(node,i)->logical_rows_delta)
+#define _cast_voidp(name, val) name = (__typeof__(name))val
+
+void *_mmalloc(int size) {
+	void *p = kmalloc(size, GFP_KERNEL);
+	return p;
+}
+
+#define MMALLOC(v) _cast_voidp(v, _mmalloc(sizeof(*v)))
+#define MMALLOC_N(n,v) _cast_voidp(v, _mmalloc((n)*sizeof(*v)))
+#define _BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
+#define _BP_STATE(node,i) ((node)->bp[i].state)
+#define _BP_WORKDONE(node,i) ((node)->bp[i].workdone)
 
 /*
  *
@@ -60,8 +65,9 @@ ftnode_memory_size_cutdown(struct _ftnode *node)
     retval += sizeof(*node);
     retval += (n_children)*(sizeof(node->bp[0]));
     retval += node->pivotkeys._total_size;
-
-    for (int i = 0; i < n_children; i++) {
+	
+    int i = 0;
+    for (i = 0; i < n_children; i++) {
     	//struct _sub_block *sb = BSB(node, i);
     	struct _sub_block *sb = node->bp[i].ptr.u.subblock;
     	retval += sizeof(*sb);
@@ -99,11 +105,12 @@ ftnode_memory_size_cutdown(struct _ftnode *node)
 long ftnode_cachepressure_size_cutdown(struct _ftnode *node) {
     long retval = 0;
     bool totally_empty = true;
+    int i = 0;
     if (node->height == 0) {
         goto exit;
     }
     else {
-        for (int i = 0; i < node->n_children; i++) {
+        for (i = 0; i < node->n_children; i++) {
     		struct _sub_block *sb = node->bp[i].ptr.u.subblock;
                 totally_empty = false;
                 retval += sb->compressed_size;
@@ -143,21 +150,23 @@ static inline struct _ftnode_nonleaf_childinfo _BNC(struct _ftnode* node, int i)
 }
 */
 
-static int ft_compare_pivot_cutdown(const struct _comparator &cmp, _dbt *key,_dbt *pivot) {
-    return cmp._cmp(key, pivot);
+static int ft_compare_pivot_cutdown(const struct _comparator *cmp, struct _dbt *key, struct _dbt *pivot) {
+    return cmp->_cmp(key, pivot);
 }
 
-int toku_ftnode_which_child_cutdown(struct _ftnode *node, struct _dbt *k, struct _comparator &cmp);
+int toku_ftnode_which_child_cutdown(struct _ftnode *node, struct _dbt *k, struct _comparator *cmp);
 
-int toku_ftnode_which_child_cutdown(struct _ftnode *node, struct _dbt *k, struct _comparator &cmp) {
+int ftnode_which_child_cutdown(struct _ftnode *node, struct _dbt *k, struct _comparator *_cmp) {
     // a funny case of no pivots
+    struct _comparator cmp;
+    init_comparator(&cmp); 
     if (node->n_children <= 1) return 0;
 
     struct _dbt pivot;
 
     // check the last key to optimize seq insertions
     int n = node->n_children-1;
-    int c = ft_compare_pivot_cutdown(cmp, k, _fill_pivot(&node->pivotkeys, n - 1, &pivot));
+    int c = ft_compare_pivot_cutdown(&cmp, k, _fill_pivot(&node->pivotkeys, n - 1, &pivot));
     if (c > 0) return n;
 
     // binary search the pivots
@@ -166,7 +175,7 @@ int toku_ftnode_which_child_cutdown(struct _ftnode *node, struct _dbt *k, struct
     int mi;
     while (lo < hi) {
         mi = (lo + hi) / 2;
-        c = ft_compare_pivot_cutdown(cmp, k, _fill_pivot(&node->pivotkeys, mi, &pivot));
+        c = ft_compare_pivot_cutdown(&cmp, k, _fill_pivot(&node->pivotkeys, mi, &pivot));
         if (c > 0) {
             lo = mi+1;
             continue;
@@ -258,6 +267,7 @@ void _create_empty_pivot(_pivot_keys *pk) {
 }
 
 void deserialize_from_rbuf_cutdown(_pivot_keys *pk, struct rbuf *rb, int n) {
+	int i = 0;
 	pk->_num_pivots = n;
 	pk->_total_size = 0;
 	pk->_fixed_keys = NULL;
@@ -265,7 +275,7 @@ void deserialize_from_rbuf_cutdown(_pivot_keys *pk, struct rbuf *rb, int n) {
 	pk->_dbt_keys = NULL;
 
 	pk->_dbt_keys = (__typeof__(pk->_dbt_keys))_mmalloc(64 * n);
-	for (int i = 0; i < n; i++) {
+	for (i = 0; i < n; i++) {
 		const void *pivotkeyptr;
 		uint32_t size;
 		size = _rbuf_int(rb);
@@ -313,8 +323,9 @@ void dump_ftnode_partition(struct _ftnode_partition *bp) {
 }
 
 void dump_sub_block(struct _sub_block *sb) {
+	int i = 0;
 	printk("=============DUMPINGSUBBLOCK==============\n");
-	for (int i = 0; i < sb->uncompressed_size; i++) {
+	for (i = 0; i < sb->uncompressed_size; i++) {
 		printk("%c", ((char *)(sb->uncompressed_ptr))[i]);
 	}		
 	printk("==========DUMPED=SUB=BLOCK================\n");	
@@ -330,3 +341,150 @@ void dump_ftnode_child_ptr_cutdown(_FTNODE_CHILD_POINTER *fcp) {
 	printk("================DUMPED===================\n");
 }
 
+int leftmost_child_wanted (struct ftnode_fetch_extra *ffe, struct _ftnode *node) {
+	if (ffe->left_is_neg_infty) {
+		return 0;
+	}
+	else if (ffe->range_lock_left_key.data == NULL) {
+		return -1;
+	}
+	else {
+		return ftnode_which_child_cutdown(node, &ffe->range_lock_left_key, NULL);
+	}
+}
+
+int rightmost_child_wanted (struct ftnode_fetch_extra *ffe, struct _ftnode *node) {
+	if (ffe->right_is_pos_infty) {
+		return node->n_children - 1;
+	}
+	else if (ffe->range_lock_right_key.data == NULL) {
+		return -1;
+	}
+	else {
+		return ftnode_which_child_cutdown(node, &ffe->range_lock_right_key, NULL);
+	}
+}
+
+int long_key_cmp(struct _dbt *a, struct _dbt *b);
+
+inline void init_comparator(struct _comparator *cmp) {
+	cmp->_cmp = &long_key_cmp;
+	cmp->_memcpy_magic = 8;
+}
+
+inline struct _sub_block *BSB(struct _ftnode *node, int i) {
+	struct _ftnode_child_pointer p = node->bp[i].ptr;
+	return p.u.subblock;	
+}
+
+inline void set_BSB(struct _ftnode *node, int i, struct _sub_block *sb) {
+	struct _ftnode_child_pointer *p = &node->bp[i].ptr;
+	p->tag = _BCT_SUBBLOCK;
+	p->u.subblock = sb; 
+}
+
+// Comparators
+int long_key_cmp(struct _dbt *a, struct _dbt *b) {
+	const long *_cast_voidp(x, a->data);
+	const long *_cast_voidp(y, b->data);
+	return (*x > *y) - (*x < *y);	
+}
+
+int _ft_compare(const struct _ft_search *a, const struct _dbt *b) {
+	struct _comparator cmp;
+	init_comparator(&cmp);
+	return cmp._cmp(a->k, b) <= 0; 
+}
+
+void init_ft_search(struct _ft_search *a) {
+	a->compare = _ft_compare;
+	a->direction = _FT_SEARCH_RIGHT;
+	_init_dbt(a->k);
+	_init_dbt(&a->pivot_bound);
+	_init_dbt(a->k_bound);	
+}
+
+int _search_which_child(struct _comparator *cmp, struct _ftnode *node, struct _ft_search *search) {
+        struct _dbt a;
+        _init_dbt(&a);
+
+        int lo = 0;
+        int hi = node->n_children - 1;
+        int mi;
+        while (lo < hi) {
+                mi = (lo + hi) / 2;
+                _fill_pivot(&node->pivotkeys, mi, &a);
+                bool c = search->compare(search, &a);
+                if (((search->direction == _FT_SEARCH_LEFT) && c) ||
+                        ((search->direction == _FT_SEARCH_RIGHT) && !c)) {
+                        hi = mi;
+                }
+                else {
+                        lo = mi + 1;
+                }
+        }
+
+        // ready to return something
+        // https://github.com/percona/PerconaFT/blob/d627ac564ae11944a363e18749c9eb8291b8c0ac/ft/ft-ops.cc#L3674
+
+        /*
+        if (search->pivot_bound.data != nullptr) {
+                if (search->direction == FT_SEARCH_LEFT) {
+                        while (lo < node->n_children - 1 && search_which_child_cmp_with_bound(cmp, node, lo, search, &pivotkey) <= 0) {
+                                lo++;
+                        }
+                }
+                else {
+                        while (lo > 0 && search_which_child_cmp_with_bound(cmp, node, lo - 1, search, &pivotkey) >= 0) {
+                                lo--;
+                        }
+                }
+        }
+        */
+        return lo;
+}
+
+
+/*
+inline struct _sub_block *BSB(struct _ftnode *node, int i) {
+	struct _ftnode_child_pointer *p = &node->bp[i].ptr;
+	return p.u.subblock;
+}
+
+inline void set_BSB(struct _ftnode *node, int i, struct _sub_block *sb) {
+	struct _ftnode_child_pointer *p = &node->bp[i].ptr;
+	p->tag = _BCT_SUBBLOCK;
+	p->u.subblock = sb;
+}
+*/
+
+void init_ffe(struct ftnode_fetch_extra *fe) {
+	fe->ft = 4;
+	fe->type = ftnode_fetch_none;
+	fe->search = NULL;
+	_init_dbt(&fe->range_lock_left_key);
+	_init_dbt(&fe->range_lock_right_key);
+	fe->left_is_neg_infty = false;
+	fe->right_is_pos_infty = false;
+	fe->child_to_read = -1;
+	fe->disable_prefetching = true;
+	fe->read_all_partitions = false;
+	fe->bytes_read = 0;
+	fe->io_time = 0;
+	fe->deserialize_time = 0;
+	fe->decompress_time = 0;
+}
+
+void sub_block_init_cutdown(struct _sub_block *sb) {
+        sb->uncompressed_ptr = 0;
+        sb->uncompressed_size = 0;
+        sb->compressed_ptr = 0;
+        sb->compressed_size_bound = 0;
+	sb->compressed_size = 0;
+	sb->xsum = 0;
+}
+
+inline void _rbuf_MSN(struct rbuf *r) {
+	_MSN msn = { .msn = rbuf_ulonglong(rb) };
+	return msn;
+}

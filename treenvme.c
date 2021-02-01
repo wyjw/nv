@@ -20,6 +20,7 @@
 //#define DEBUGMAX 1
 //#define DEBUGEX1 1
 //#define TIME 1
+#define FAKE 1
 
 // Hardcoded magic variables
 #define TREENVME_OFF_BLOCKTABLE 0ULL
@@ -1097,6 +1098,7 @@ static int page_match(struct request *req, char *page, int page_size)
 }
 */
 
+/*
 static int
 ft_search_node_cutdown (
     FT_HANDLE ft_handle,
@@ -1235,7 +1237,7 @@ ft_search_node_cutdown(
     }
 }
 
-/* search in a node's child */
+// search in a node's child
 static int
 ft_search_child_cutdown(FT_HANDLE ft_handle, struct _ftnode *node, int childnum, ft_search *search, FT_GET_CALLBACK_FUNCTION getf, void *getf_v, bool *doprefetch, FT_CURSOR ftcursor, UNLOCKERS unlockers, struct _ancestors *ancestors, const pivot_bounds &bounds, bool can_bulk_fetch)
 // Effect: Search in a node's child.  Searches are read-only now (at least as far as the hardcopy is concerned).
@@ -1530,6 +1532,400 @@ static void cachetable_fetch_pair(
         p->value_rwlock.write_unlock();
     }
     pair_unlock(p);
+}
+*/
+
+static struct _ftnode *alloc__ftnode_for_deserialize(uint32_t fullhash, _BLOCKNUM blocknum) {
+// Effect: Allocate an FTNODE and fill in the values that are not read from
+    struct _ftnode *MMALLOC(node);
+    node->fullhash = fullhash;
+    node->blocknum = blocknum;
+    //node->clear_dirty();
+    node->oldest_referenced_xid_known = 0;
+    node->bp = NULL;
+    node->ct_pair = NULL;
+    return node; 
+}
+
+static void
+setup_available_ftnode_partition_cutdown(struct _ftnode *node, int i) {
+    if (node->height == 0) {
+        //set_BLB(cast_from__ftnode(node), i, toku_create_empty_bn());
+	//MSN m = { .msn = node->max_msn_applied_to_node_on_disk.msn };
+        //BLB_MAX_MSN_APPLIED(node,i) = (MSN)m;
+#ifdef DEBUG
+	printk("Got into leaf node.\n");
+#endif
+    }
+    else {
+        //set_BNC(cast_from__ftnode(node), i, toku_create_empty_nl());
+    }
+#ifdef DEBUG
+	dump_ftnode_cutdown(node);
+#endif
+}
+
+void setup_ftnode_partitions_cutdown(struct _ftnode* node, struct ftnode_fetch_extra *bfe, bool data_in_memory) {
+        int i = 0;
+	if (bfe->type == ftnode_fetch_subset) {
+		struct _comparator cmp;
+		init_comparator(&cmp);
+                bfe->child_to_read = _search_which_child(&cmp, node, bfe->search);
+        }
+        // setup_partitions_using_bfe
+        // https://github.com/percona/PerconaFT/blob/d627ac564ae11944a363e18749c9eb8291b8c0ac/ft/serialize/ft_node-serialize.cc
+        int lc, rc;
+        if (bfe->type == ftnode_fetch_subset)
+        {
+                lc = leftmost_child_wanted(bfe, node);
+                rc = rightmost_child_wanted(bfe, node);
+        }
+
+        for (i = 0; i < node->n_children; i++) {
+                BP_INIT_UNTOUCHED_CLOCK(node,i);
+                if (data_in_memory) {
+                        BP_STATE(node, i) = (((lc <= i && i <= rc))
+                                 ? _PT_AVAIL : _PT_COMPRESSED);
+                } else {
+                        BP_STATE(node, i) = _PT_ON_DISK;
+                }
+                BP_WORKDONE(node,i) = 0;
+
+                switch (BP_STATE(node,i)) {
+                case _PT_AVAIL:
+                        setup_available_ftnode_partition_cutdown(node, i);
+                        //BP_TOUCH_CLOCK(node,i);
+                        break;
+                case _PT_COMPRESSED:
+                        //set_BSB(node, i, sub_block_creat());
+                        break;
+                case _PT_ON_DISK:
+                        //set_BNULL(node, i);
+                        break;
+                case _PT_INVALID:
+                        //abort();
+			break;
+                }
+        }
+}
+
+static int deserialize_ftnode_partition_cutdown(
+    struct _sub_block *sb,
+    struct _ftnode *node,
+    int childnum,  // which partition to deserialize
+    struct _comparator *cmp) {
+
+    int r = 0;
+    uint32_t data_size;
+    data_size = sb->uncompressed_size - 4; // checksum is 4 bytes at end
+
+    //NOTE: Checksum stuff missing.
+    // now with the data verified, we can read the information into the node
+    struct rbuf rb;
+    _rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
+    unsigned char ch;
+    ch = _rbuf_int(&rb);
+
+/*
+#ifdef DEBUG
+	dump_ftnode_child_ptr_cutdown(&node->bp->ptr);
+#endif
+*/
+    /*
+    if (node->height > 0) {
+        if (ch != FTNODE_PARTITION_MSG_BUFFER) {
+            	printk("not partition");
+		assert(ch == FTNODE_PARTITION_MSG_BUFFER);
+        }
+       	struct ftnode_nonleaf_childinfo *bnc = BNC(cast_from__ftnode(node), childnum);
+        if (node->layout_version_read_from_disk <= FT_LAYOUT_VERSION_26) {
+            // Layout version <= 26 did not serialize sorted message trees to disk.
+            deserialize_child_buffer_v26(bnc, &rb, cmp);
+        } else {
+            deserialize_child_buffer(bnc, &rb);
+        }
+        BP_WORKDONE(node, childnum) = 0;
+    } else {
+        if (ch != FTNODE_PARTITION_DMT_LEAVES) {
+            fprintf(stderr,
+                    "%s:%d:deserialize_ftnode_partition - "
+                    "file[%s], blocknum[%ld], ch[%d] != "
+                    "FTNODE_PARTITION_DMT_LEAVES[%d]\n",
+                    __FILE__,
+                    __LINE__,
+                    fname ? fname : "unknown",
+                    node->blocknum.b,
+                    ch,
+                    FTNODE_PARTITION_DMT_LEAVES);
+            dump_bad_block(rb.buf, rb.size);
+            assert(ch == FTNODE_PARTITION_DMT_LEAVES);
+        }
+	printk("Number of children at this point is %u\n", node->n_children);
+        printk("Did we even get here?\n");
+	struct ftnode hn;
+	memcpy(&hn, node, sizeof(struct ftnode));
+#ifdef DEBUG
+	printk("==================SIZECOMPARISON===============");
+	printk("Size is %u for _node and %u for node\n", sizeof(struct _ftnode), sizeof(struct ftnode));
+	printk("Num child is %u for _node and %u for node\n", (cast_from__ftnode(node))->n_children, node->n_children);
+	compare_ftnode_and__ftnode(cast_from__ftnode(node), node); 
+	//compare_ftnode_and__ftnode(&hn, node); 
+#endif
+        BLB_SEQINSERT(cast_from__ftnode(node), childnum) = 0;
+        uint32_t num_entries = rbuf_int(&rb);
+        // we are now at the first byte of first leafentry
+#ifdef DEBUG
+	dump_ftnode_cutdown(node);
+#endif
+        data_size -= rb.ndone; // remaining bytes of leafentry data
+	BASEMENTNODE bn = BLB(cast_from__ftnode(node), childnum);
+        bn->data_buffer.deserialize_from_rbuf(
+            num_entries, &rb, data_size, node->layout_version_read_from_disk);
+    }
+    if (rb.ndone != rb.size) {
+        fprintf(stderr,
+                "%s:%d:deserialize_ftnode_partition - "
+                "file[%s], blocknum[%ld], rb.ndone[%d] != rb.size[%d]\n",
+                __FILE__,
+                __LINE__,
+                fname ? fname : "unknown",
+                node->blocknum.b,
+                rb.ndone,
+                rb.size);
+        dump_bad_block(rb.buf, rb.size);
+        assert(rb.ndone == rb.size);
+    }
+    */
+
+exit:
+    return r;
+}
+static int decompress_and_deserialize_worker_cutdown(struct rbuf curr_rbuf,
+                                             struct _sub_block curr_sb,
+                                             struct _ftnode *node,
+                                             int child,
+                                             struct _comparator *cmp) {
+    int r = 0;
+    r = read_and_decompress_sub_block_cutdown(&curr_rbuf, &curr_sb);
+    if (r != 0) {
+	printk("Decompress and deserialize broke.\n");        
+	goto exit;
+    }
+#ifdef DEBUG 
+    dump_sub_block(&curr_sb);
+#endif
+    // at this point, sb->uncompressed_ptr stores the serialized node partition
+    r = deserialize_ftnode_partition_cutdown(&curr_sb, node, child, cmp);
+    if (r != 0) {
+        printk("Deserialize ftnode partition broke.\n");
+	goto exit;
+    }
+
+exit:
+    kfree(curr_sb.uncompressed_ptr);
+    return r;
+}
+
+int check_and_copy_compressed_sub_block_worker_cutdown(struct rbuf curr_rbuf,
+                                                      struct _sub_block curr_sb,
+                                                      struct _ftnode *node,
+                                                      int child) {
+    int r = 0;
+    r = read_compressed_sub_block_cutdown(&curr_rbuf, &curr_sb);
+    if (r != 0) {
+        goto exit;
+    }
+
+    struct _sub_block *bp_sb;
+    bp_sb = BSB(node, child);
+    bp_sb->compressed_size = curr_sb.compressed_size;
+    bp_sb->uncompressed_size = curr_sb.uncompressed_size;
+    bp_sb->compressed_ptr = _mmalloc(bp_sb->compressed_size);
+    memcpy(
+        bp_sb->compressed_ptr, curr_sb.compressed_ptr, bp_sb->compressed_size);
+exit:
+    return r;
+}
+
+int deserialize_ftnode_info_cutdown(struct _sub_block *sb, struct _ftnode *node) {
+    int r = 0;
+#ifdef DEBUG
+    dump_ftnode_cutdown(node);
+#endif
+    uint32_t data_size;
+    data_size = sb->uncompressed_size - 4; // checksum is 4 bytes at end
+
+    struct rbuf rb;
+    rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
+
+    MSN tmsn = rbuf_MSN(&rb);
+    _MSN _tmsn = { .msn = tmsn.msn };
+    node->max_msn_applied_to_node_on_disk = _tmsn;
+    (void)rbuf_int(&rb);
+    node->flags = rbuf_int(&rb);
+    node->height = rbuf_int(&rb);
+    if (node->layout_version_read_from_disk < FT_LAYOUT_VERSION_19) {
+        (void) rbuf_int(&rb); // optimized_for_upgrade
+    }
+    if (node->layout_version_read_from_disk >= FT_LAYOUT_VERSION_22) {
+        rbuf_TXNID(&rb, &node->oldest_referenced_xid_known);
+    }
+    if (node->n_children > 1) {
+        deserialize_from_rbuf_cutdown(&node->pivotkeys, &rb, node->n_children - 1);
+    } else {
+        _create_empty_pivot(&node->pivotkeys);
+    }
+    if (node->height > 0) {
+        for (int i = 0; i < node->n_children; i++) {
+	    BLOCKNUM _bn = rbuf_blocknum(&rb);
+            _BP_BLOCKNUM(node, i) = { .b = _bn.b };
+            _BP_WORKDONE(node, i) = 0;
+        }
+    }
+    if (data_size != rb.ndone) {
+    	printk("Bad data size in ftnode info.\n"); 
+    }
+exit:
+    return r;
+}
+
+
+#define malloc(size) kmalloc(size, GFP_KERNEL)
+// deserialize_ftnode_from_rbuf_cutdown
+// read_ftnode_header_from_fd_into_rbuf_if_small_enough_cutdown
+// deserialize_ftnode_header_from_rbuf_if_small_enough_cutdown
+static int page_match(struct request *req, char *page, int page_size)
+{	
+	int r = 0;	
+	struct _sub_block sb_node_info;
+	struct ftnode_disk_data *ndd;
+	int i = 0;
+#ifdef FAKE
+	int fullhash = 3000;
+	_BLOCKNUM blocknum = { .b = 3 };
+#endif
+	struct rbuf *rb = malloc(sizeof(struct rbuf));
+	_rbuf_init(rb, page, page_size);
+
+	struct _ftnode *node = alloc__ftnode_for_deserialize(fullhash, blocknum); 
+	// bfe->ft->blocktable.translate_blocknum_to_offset_size_cutdown(blocknum, &offset, &size);
+	node->fullhash = fullhash;
+	node->blocknum = blocknum;
+	node->oldest_referenced_xid_known = 0;
+    node->bp = NULL;
+    node->ct_pair = NULL;	
+    
+	const void *magic;
+    _rbuf_literal_bytes(rb, &magic, 8);
+    if (memcmp(magic, "tokuleaf", 8) != 0 &&
+        memcmp(magic, "tokunode", 8) != 0) {
+	printk("First 8 magic bytes broken.\n");
+        goto cleanup;
+    }
+
+    node->layout_version_read_from_disk = _rbuf_int(rb);
+
+    // Check if we are reading in an older node version.
+    if (node->layout_version_read_from_disk <= FT_LAYOUT_VERSION_14) {
+        printk("Layout_version broken.");
+	goto cleanup;
+    }
+
+    node->layout_version = node->layout_version_read_from_disk;
+    node->layout_version_original = _rbuf_int(rb);
+    node->build_id = _rbuf_int(rb);
+    node->n_children = _rbuf_int(rb);
+    MMALLOC_N(node->n_children, node->bp);
+    MMALLOC_N(node->n_children, ndd);
+    // read the partition locations
+    for (i=0; i<node->n_children; i++) {
+        BP_START(ndd,i) = _rbuf_int(rb);
+        BP_SIZE (ndd,i) = _rbuf_int(rb);
+    }
+    // verify checksum of header stored
+    uint32_t checksum;
+    //checksum = toku_x1764_memory(rb->buf, rb->ndone);
+    uint32_t stored_checksum;
+    stored_checksum = _rbuf_int(rb);
+    /*
+    if (stored_checksum != checksum) {
+    	printk("Bad checksum.\n");
+    }
+    */
+
+    sub_block_init_cutdown(&sb_node_info);
+    {
+        r = read_compressed_sub_block_cutdown(rb, &sb_node_info);
+        if (r != 0) {
+       		printk("Read and decompress messed up.\n");
+		goto cleanup;
+	}
+    }
+
+    r = deserialize_ftnode_info_cutdown(&sb_node_info, node);
+    if (r != 0) {
+        goto cleanup;
+    }
+    kfree(sb_node_info.uncompressed_ptr);
+    struct ftnode_fetch_extra bfe;
+    init_ffe(&bfe);
+    setup_ftnode_partitions_cutdown(node, &bfe, true);
+
+    for (i = 0; i < node->n_children; i++) {
+        uint32_t curr_offset = BP_START(ndd, i);
+        uint32_t curr_size = BP_SIZE(ndd, i);
+        struct rbuf curr_rbuf = {.buf = NULL, .size = 0, .ndone = 0};
+        _rbuf_init(&curr_rbuf, rb->buf + curr_offset, curr_size);
+
+        struct _sub_block curr_sb;
+        sub_block_init_cutdown(&curr_sb);
+	struct _comparator cmp;
+	init_comparator(&cmp);
+        switch (BP_STATE(node, i)) {
+            case _PT_AVAIL: {
+                //  case where we read and decompress the partition
+                r = decompress_and_deserialize_worker_cutdown(
+                    curr_rbuf,
+                    curr_sb,
+                    node,
+                    i,
+                    &cmp);
+                if (r != 0) {
+                    printk("decompress broke.\n");
+                    goto cleanup;
+                }
+                break;
+            }
+        case _PT_COMPRESSED:
+            // case where we leave the partition in the compressed state
+            r = check_and_copy_compressed_sub_block_worker_cutdown(curr_rbuf, curr_sb, node, i);
+                if (r != 0) {
+                printk("copy and compress broke.\n");
+                goto cleanup;
+	    }
+            break;
+        case _PT_INVALID: // this is really bad
+        case _PT_ON_DISK: // it's supposed to be in memory.
+            break;
+	}
+    }
+    //*ftnode = node;
+    r = 0;
+    dump_ftnode_cutdown(node);  
+cleanup:
+    if (r == 0) {
+        //toku_ft_status_update_deserialize_times(node, deserialize_time, decompress_time);
+    }
+    if (r != 0) {
+        // NOTE: Right now, callers higher in the stack will assert on
+        // failure, so this is OK for production.  However, if we
+        // create tools that use this function to search for errors in
+        // the FT, then we will leak memory.
+        if (node) {
+            kfree(node);
+        }
+    }
+    return r;
 }
 
 static int __init treenvme_init(void)
