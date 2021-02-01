@@ -539,11 +539,15 @@ struct _ctpair {
 inline void _rbuf_init(struct rbuf *r, unsigned char *buf, unsigned int size);
 unsigned int _rbuf_int (struct rbuf *r);
 inline void _rbuf_literal_bytes(struct rbuf *r, const void **bytes, unsigned int n_bytes);
-inline void _rbuf_MSN(struct rbuf *r);
+inline unsigned long long _rbuf_ulonglong(struct rbuf *r);
+inline _MSN _rbuf_MSN(struct rbuf *r);
+inline void _rbuf_TXNID(struct rbuf *r, _TXNID *txnid);
+inline _BLOCKNUM _rbuf_blocknum(struct rbuf *rb);
 
 #define BP_START(node_dd,i) ((node_dd)[i].start)
 #define BP_SIZE(node_dd,i) ((node_dd)[i].size)
 #define BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
+#define _BP_BLOCKNUM(node,i) ((node)->bp[i].blocknum)
 #define BP_STATE(node,i) ((node)->bp[i].state)
 #define BP_WORKDONE(node, i)((node)->bp[i].workdone)
 #define BP_TOUCH_CLOCK(node, i) ((node)->bp[i].clock_count = 1)

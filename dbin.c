@@ -484,7 +484,22 @@ void sub_block_init_cutdown(struct _sub_block *sb) {
 	sb->xsum = 0;
 }
 
-inline void _rbuf_MSN(struct rbuf *r) {
-	_MSN msn = { .msn = rbuf_ulonglong(rb) };
+inline unsigned long long _rbuf_ulonglong(struct rbuf *r) {
+	unsigned i0 = _rbuf_int(r);
+	unsigned i1 = _rbuf_int(r);
+	return ((unsigned long long)(i0) << 32) | ((unsigned long long)(i1));
+}
+
+inline _MSN _rbuf_MSN(struct rbuf *rb) {
+	_MSN msn = { .msn = _rbuf_ulonglong(rb) };
 	return msn;
+}
+
+inline void _rbuf_TXNID(struct rbuf *rb, _TXNID *txnid) {
+	*txnid = _rbuf_ulonglong(rb);
+}
+
+inline _BLOCKNUM _rbuf_blocknum(struct rbuf *rb) {
+	_BLOCKNUM result = { .b = _rbuf_ulonglong(rb) };
+	return result;
 }

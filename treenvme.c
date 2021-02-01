@@ -1749,6 +1749,7 @@ exit:
 
 int deserialize_ftnode_info_cutdown(struct _sub_block *sb, struct _ftnode *node) {
     int r = 0;
+    int i = 0;
 #ifdef DEBUG
     dump_ftnode_cutdown(node);
 #endif
@@ -1756,19 +1757,22 @@ int deserialize_ftnode_info_cutdown(struct _sub_block *sb, struct _ftnode *node)
     data_size = sb->uncompressed_size - 4; // checksum is 4 bytes at end
 
     struct rbuf rb;
-    rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
+    _rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
 
-    MSN tmsn = rbuf_MSN(&rb);
-    _MSN _tmsn = { .msn = tmsn.msn };
-    node->max_msn_applied_to_node_on_disk = _tmsn;
-    (void)rbuf_int(&rb);
-    node->flags = rbuf_int(&rb);
-    node->height = rbuf_int(&rb);
-    if (node->layout_version_read_from_disk < FT_LAYOUT_VERSION_19) {
-        (void) rbuf_int(&rb); // optimized_for_upgrade
+    _MSN tmsn = _rbuf_MSN(&rb);
+    node->max_msn_applied_to_node_on_disk = tmsn;
+    (void)_rbuf_int(&rb);
+    node->flags = _rbuf_int(&rb);
+    node->height = _rbuf_int(&rb);
+
+    // version 19
+    if (node->layout_version_read_from_disk < 19) {
+        (void) _rbuf_int(&rb); // optimized_for_upgrade
     }
-    if (node->layout_version_read_from_disk >= FT_LAYOUT_VERSION_22) {
-        rbuf_TXNID(&rb, &node->oldest_referenced_xid_known);
+
+    // version 22
+    if (node->layout_version_read_from_disk >= 22) {
+        _rbuf_TXNID(&rb, &node->oldest_referenced_xid_known);
     }
     if (node->n_children > 1) {
         deserialize_from_rbuf_cutdown(&node->pivotkeys, &rb, node->n_children - 1);
@@ -1776,9 +1780,9 @@ int deserialize_ftnode_info_cutdown(struct _sub_block *sb, struct _ftnode *node)
         _create_empty_pivot(&node->pivotkeys);
     }
     if (node->height > 0) {
-        for (int i = 0; i < node->n_children; i++) {
-	    BLOCKNUM _bn = rbuf_blocknum(&rb);
-            _BP_BLOCKNUM(node, i) = { .b = _bn.b };
+        for (i = 0; i < node->n_children; i++) {
+	    _BLOCKNUM _bn = _rbuf_blocknum(&rb);
+            _BP_BLOCKNUM(node, i) = _bn;
             _BP_WORKDONE(node, i) = 0;
         }
     }
