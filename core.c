@@ -778,8 +778,13 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 	cmd->common.command_id = req->tag;
 
 	// alter
-	if (req)
+	/*
+	if (req->alter_count == 0)
 	{
+	}
+	*/
+	if (req->bio && req->bio->_imposter_level > 0) {
+		req->_imposter_command = *cmd;
 		req->first_command_id = cmd->common.command_id;
 	}
 	
@@ -2125,6 +2130,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 };
 #endif /* CONFIG_NVME_MULTIPATH */
 
+
 #ifdef CONFIG_NVME_TREENVME
 const struct block_device_operations treenvme_fops = {
 	.owner		= THIS_MODULE,
@@ -2135,7 +2141,9 @@ const struct block_device_operations treenvme_fops = {
 	.getgeo		= nvme_getgeo,
 	.pr_ops		= &nvme_pr_ops,
 };
-#endif /* CONFIG_NVME_TREENVME */
+EXPORT_SYMBOL_GPL(treenvme_fops);
+#endif
+
 
 static int nvme_wait_ready(struct nvme_ctrl *ctrl, u64 cap, bool enabled)
 {
@@ -3192,7 +3200,7 @@ static struct attribute *nvme_ns_id_attrs[] = {
 	NULL,
 };
 
-static umode_t nvme_ns_id_attrs_are_visible(struct kobject *kobj,
+umode_t nvme_ns_id_attrs_are_visible(struct kobject *kobj,
 		struct attribute *a, int n)
 {
 	struct device *dev = container_of(kobj, struct device, kobj);
@@ -3213,7 +3221,7 @@ static umode_t nvme_ns_id_attrs_are_visible(struct kobject *kobj,
 	}
 #ifdef CONFIG_NVME_MULTIPATH
 	if (a == &dev_attr_ana_grpid.attr || a == &dev_attr_ana_state.attr) {
-		if (dev_to_disk(dev)->fops != &nvme_fops) /* per-path attr */
+		if (dev_to_disk(dev)->fops != &nvme_fops)
 			return 0;
 		if (!nvme_ctrl_use_ana(nvme_get_ns_from_dev(dev)->ctrl))
 			return 0;
@@ -3221,8 +3229,10 @@ static umode_t nvme_ns_id_attrs_are_visible(struct kobject *kobj,
 #endif
 	return a->mode;
 }
+EXPORT_SYMBOL_GPL(nvme_ns_id_attrs_are_visible);
 
-static const struct attribute_group nvme_ns_id_attr_group = {
+
+const struct attribute_group nvme_ns_id_attr_group = {
 	.attrs		= nvme_ns_id_attrs,
 	.is_visible	= nvme_ns_id_attrs_are_visible,
 };
@@ -3234,6 +3244,7 @@ const struct attribute_group *nvme_ns_id_attr_groups[] = {
 #endif
 	NULL,
 };
+EXPORT_SYMBOL_GPL(nvme_ns_id_attr_groups);
 
 #define nvme_show_str_function(field)						\
 static ssize_t  field##_show(struct device *dev,				\

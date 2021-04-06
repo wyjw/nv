@@ -8,7 +8,8 @@ obj-$(CONFIG_NVME_FABRICS)		+= nvme-fabrics.o
 obj-$(CONFIG_NVME_RDMA)			+= nvme-rdma.o
 obj-$(CONFIG_NVME_FC)			+= nvme-fc.o
 obj-$(CONFIG_NVME_TCP)			+= nvme-tcp.o
-obj-$(CONFIG_NVME_TREENVME)		+= nvme-treenvme.o dbin.o
+#obj-$(CONFIG_NVME_TREENVME)		+= treenvme.o
+obj-$(CONFIG_BPF_TREENVME)		+= bpf-ddp.o
 
 nvme-core-y				:= core.o
 nvme-core-$(CONFIG_TRACING)		+= trace.o
@@ -17,10 +18,11 @@ nvme-core-$(CONFIG_NVM)			+= lightnvm.o
 nvme-core-$(CONFIG_FAULT_INJECTION_DEBUG_FS)	+= fault_inject.o
 nvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
 #nvme-core-$(CONFIG_NVME_TREENVME)	+= treenvme.o
+#nvme-core-$(CONFIG_BPF_TREENVME)	+= bpf-ddp.o
 
 nvme-y					+= pci.o
-
-nvme-treenvme-y				+= treenvme.o
+#nvme-tree-$(CONFIG_NVME_TREENVME)	+= core.o pci.o treenvme.o
+nvme-$(CONFIG_NVME_TREENVME)		+= treenvme.o
 
 nvme-fabrics-y				+= fabrics.o
 

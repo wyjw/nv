@@ -62,11 +62,16 @@ struct treenvme_block_translation_pair {
 };
 
 struct treenvme_block_table {
+	int64_t length_of_array;
+	unsigned long *arr;
+};
+
+struct treenvme_block_toku_table {
 	enum treenvme_translation_type type;
 	int64_t length_of_array;
 	struct treenvme_block_struct smallest;
 	struct treenvme_block_struct next_head;
-	struct treenvme_block_translation_pair *block_translation; 
+	struct treenvme_block_translation_pair *block_translation;
 };
 
 struct treenvme_params {
@@ -80,4 +85,5 @@ struct treenvme_params {
 #define TREENVME_IOCTL_IO_CMD 			_IOWR('$', 0x52, struct treenvme_passthru_cmd)
 #define TREENVME_IOCTL_SETUP 			_IOWR('$', 0x53, struct treenvme_params)
 #define TREENVME_IOCTL_REGISTER_BLOCKTABLE	_IOWR('$', 0x54, struct treenvme_block_table)
+#define TREENVME_IOCTL_REGISTER_TOKU_BLOCKTABLE	_IOWR('$', 0x55, struct treenvme_block_toku_table)
 #endif

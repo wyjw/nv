@@ -14,17 +14,35 @@
 #include <trace/events/block.h>
 #include "nvme.h"
 #include "tokuspec.h"
-#include "dbin.h"
+#include "simplekvspec.h"
 
-#define DEBUG 1
+/*@ddp*/
+#include <linux/bpf.h>
+#include <linux/bpf_ddp.h>
+#include <linux/filter.h>
+
+//#define DEBUG 1
 //#define DEBUGMAX 1
 //#define DEBUGEX1 1
 //#define TIME 1
-#define FAKE 1
+#define SIMPLEBPF 1
+#define DEBUG2 1
+#define DEBUGS 1
+#define FILE_MASK ((ptr__t)1 << 63)
 
 // Hardcoded magic variables
 #define TREENVME_OFF_BLOCKTABLE 0ULL
 #define TREENVME_OFF_SQES	0x8000000ULL
+#define SIMPLEKV 1
+#ifdef SIMPLEKV
+//#define SHORTCUT
+#endif
+//#define TOKUDB 1
+
+#ifdef TOKUDB
+#undef SIMPLEKV
+#endif
+#define KEYINBUF 1 
 
 static int counter = 0;
 
@@ -44,84 +62,28 @@ struct block_table;
 struct pivot_bounds;
 struct DBT;
 
-struct treenvme_ctx {
-	struct nvme_dev *dev;
-	struct block_table *bt;
-	struct task_struct *task;
+struct key_entry{
+	unsigned long a;
+	struct list_head entry;
 };
 
-static struct treenvme_ctx *tctx;
-static const struct file_operations treenvme_ctrl_fops;
-static struct kmem_cache *node_cachep; 
 static int page_match(struct request *rq, char *page, int page_size);
+static int page_match_tokudb(struct request *rq, char *page, int page_size);
 static int treenvme_setup_ctx(struct nvme_ns *ns, void *argp);
+//void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, volatile struct nvme_completion *cqe);
+int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
 
-void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags)
+//MTC
+//inline void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
+
+// MACROS
+
+
+static inline void *bio_data_none(struct bio *bio)
 {
-	sprintf(disk_name, "treenvme%d", ctrl->subsys->instance);
+	return page_address(bio_page(bio)) + bio_offset(bio);
 }
 
-blk_qc_t treenvme_make_request(struct request_queue *q, struct bio *bio)
-{
-	struct nvme_ns *ns = q->queuedata;
-	struct device *dev = disk_to_dev(ns->tdisk);
-
-	blk_qc_t ret = BLK_QC_T_NONE;
-	int srcu_idx;
-
-	blk_queue_split(q, &bio);
-	bio->bi_disk = ns->disk;
-	bio->bi_opf |= REQ_TREENVME;
-	ret = direct_make_request(bio);
-
-	return ret;
-}
-
-// taken from io_uring
-static void *treenvme_validate_mmap_request(struct file *file, loff_t pgoff, size_t sz)
-{
-	struct treenvme_ctx *_tctx = file->private_data;
-	loff_t offset = pgoff << PAGE_SHIFT;
-	struct page *page;
-	void *ptr;
-
-	switch(offset) {
-	case TREENVME_OFF_BLOCKTABLE:
-#ifdef DEBUG
-		printk(KERN_ERR "Mmap'ed at the block table.\n");
-#endif
-		ptr = _tctx->bt;
-		break;
-	case TREENVME_OFF_SQES:
-#ifdef DEBUG
-		printk(KERN_ERR "Mmap'ed at the submission events.\n");
-#endif
-		ptr = _tctx->bt;
-		break;
-	default:
-		return ERR_PTR(-EINVAL);
-	}	
-
-	page = virt_to_head_page(ptr);
-	if (sz > page_size(page))
-		return ERR_PTR(-EINVAL);
-
-	return ptr;
-}
-
-static int treenvme_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	size_t sz = vma->vm_end - vma->vm_start;
-	unsigned long pfn;
-	void *ptr;
-
-	ptr = treenvme_validate_mmap_request(file, vma->vm_pgoff, sz);
-	if (IS_ERR(ptr))
-		return PTR_ERR(ptr);
-
-	pfn = virt_to_phys(ptr) >> PAGE_SHIFT;
-
-}
 /*
 int treenvme_alloc_disk(struct nvme_ctrl *ctrl, struct treenvme_head *thead)
 {
@@ -161,384 +123,7 @@ int treenvme_resubmit_path(struct nvme_queue *nvmeq, struct request *rq, u16 idx
 	volatile struct nvme_completion *cqe = &nvmeq->cqes[idx];
 }
 */
-
-inline void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid) {
-	struct gendisk *treedisk;
-	char disk_name[DISK_NAME_LEN];
-	struct nvme_id_ns *id;
-	int node = ctrl->numa_node, flags = GENHD_FL_EXT_DEVT;
-	int ret;
-
-	ret = nvme_identify_ns(ctrl, nsid, &id);
-
-	printk(KERN_ERR "Got into treenvme creation. \n");
-	ns->tqueue = blk_alloc_queue(treenvme_make_request, ctrl->numa_node);
-	ns->tqueue->queuedata = ns;
-	blk_queue_logical_block_size(ns->tqueue, 1 << ns->lba_shift);
-	nvme_set_queue_limits(ctrl, ns->tqueue);
-
-	treenvme_set_name(disk_name, ns, ctrl, &flags);
-	treedisk = alloc_disk_node(0, node);
-	
-	treedisk->fops = &treenvme_fops;
-	treedisk->private_data = ns;
-	treedisk->queue = ns->tqueue;
-	treedisk->flags = flags;
-	memcpy(treedisk->disk_name, disk_name, DISK_NAME_LEN);
-	ns->tdisk = treedisk;
-
-	__nvme_revalidate_disk(treedisk, id);
-	nvme_get_ctrl(ctrl);
-	printk(KERN_ERR "Disk name added is: %s\n", disk_name);
-	device_add_disk(ctrl->device, ns->tdisk, nvme_ns_id_attr_groups);	
-
-}	
-
-static int treenvme_get_fd(struct treenvme_ctx *tctx)
-{
-	struct file *file;
-	int ret;
-
-	ret = get_unused_fd_flags( O_RDWR | O_CLOEXEC );
-	if (ret < 0)
-		goto err; 
-	file = anon_inode_getfile("[treenvme]", &treenvme_ctrl_fops, tctx, O_RDWR | O_CLOEXEC);
-	if (IS_ERR(file)){
-		put_unused_fd(ret);
-		ret = PTR_ERR(file);
-		goto err;
-	}
-err:
-	return -1;
-}
-// setup
-static int treenvme_setup_ctx(struct nvme_ns *ns, void *argp) 
-{
-	int r;
-#ifdef DEBUG
-	printk(KERN_ERR "Got into treenvme context setup.\n");
-#endif
-	struct nvme_ns *file;
-	tctx->task = get_task_struct(current);	
-	
-	r = treenvme_get_fd(tctx);
-#ifdef DEBUG
-	printk(KERN_ERR "File is %u\n", r);
-#endif
-	return r;
-}
-
-// All the treenvme operations
-
-static void *treenvme_add_user_metadata(struct bio *bio, void __user *ubuf,
-		unsigned len, u32 seed, bool write)
-{
-	struct bio_integrity_payload *bip;
-	int ret = -ENOMEM;
-	void *buf;
-
-	buf = kmalloc(len, GFP_KERNEL);
-	if (!buf)
-		goto out;
-
-	ret = -EFAULT;
-	if (write && copy_from_user(buf, ubuf, len))
-		goto out_free_meta;
-
-	bip = bio_integrity_alloc(bio, GFP_KERNEL, 1);
-	if (IS_ERR(bip)) {
-		ret = PTR_ERR(bip);
-		goto out_free_meta;
-	}
-
-	bip->bip_iter.bi_size = len;
-	bip->bip_iter.bi_sector = seed;
-	ret = bio_integrity_add_page(bio, virt_to_page(buf), len,
-			offset_in_page(buf));
-	if (ret == len)
-		return buf;
-	ret = -ENOMEM;
-out_free_meta:
-	kfree(buf);
-out:
-	return ERR_PTR(ret);
-}
-
-static int treenvme_submit_user_cmd(struct request_queue *q,
-		struct nvme_command *cmd, void __user *ubuffer,
-		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
-		u32 meta_seed, u64 *result, unsigned timeout)
-{
-	bool write = nvme_is_write(cmd);
-	struct nvme_ns *ns = q->queuedata;
-	struct gendisk *disk = ns ? ns->disk : NULL;
-	struct request *req;
-	struct bio *bio = NULL;
-	void *meta = NULL;
-	int ret;
-
-	req = nvme_alloc_request(q, cmd, 0, NVME_QID_ANY);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
-
-	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
-	nvme_req(req)->flags |= NVME_REQ_USERCMD;
-
-	if (ubuffer && bufflen) {
-		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
-				GFP_KERNEL);
-		if (ret)
-			goto out;
-		bio = req->bio;
-		bio->bi_disk = disk;
-		if (disk && meta_buffer && meta_len) {
-			meta = treenvme_add_user_metadata(bio, meta_buffer, meta_len,
-					meta_seed, write);
-			if (IS_ERR(meta)) {
-				ret = PTR_ERR(meta);
-				goto out_unmap;
-			}
-			req->cmd_flags |= REQ_INTEGRITY;
-		}
-	}
-
-	blk_execute_rq(req->q, disk, req, 0);
-	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
-		ret = -EINTR;
-	else
-		ret = nvme_req(req)->status;
-	if (result)
-		*result = le64_to_cpu(nvme_req(req)->result.u64);
-	if (meta && !ret && !write) {
-		if (copy_to_user(meta_buffer, meta, meta_len))
-			ret = -EFAULT;
-	}
-	kfree(meta);
- out_unmap:
-	if (bio)
-		blk_rq_unmap_user(bio);
- out:
-	blk_mq_free_request(req);
-	return ret;
-}
-
-static void __user *nvme_to_user_ptr(uintptr_t ptrval)
-{
-	if (in_compat_syscall())
-		ptrval = (compat_uptr_t)ptrval;
-	return (void __user *)ptrval;
-}
-
-static int treenvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
-{
-	struct nvme_user_io io;
-	struct nvme_command c;
-	unsigned length, meta_len;
-	void __user *metadata;
-
-	if (copy_from_user(&io, uio, sizeof(io)))
-		return -EFAULT;
-	if (io.flags)
-		return -EINVAL;
-
-	switch (io.opcode) {
-	case nvme_cmd_write:
-	case nvme_cmd_read:
-	case nvme_cmd_compare:
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	length = (io.nblocks + 1) << ns->lba_shift;
-	meta_len = (io.nblocks + 1) * ns->ms;
-	metadata = nvme_to_user_ptr(io.metadata);
-
-	if (ns->ext) {
-		length += meta_len;
-		meta_len = 0;
-	} else if (meta_len) {
-		if ((io.metadata & 3) || !io.metadata)
-			return -EINVAL;
-	}
-
-	memset(&c, 0, sizeof(c));
-	c.rw.opcode = io.opcode;
-	c.rw.flags = io.flags;
-	c.rw.nsid = cpu_to_le32(ns->head->ns_id);
-	c.rw.slba = cpu_to_le64(io.slba);
-	c.rw.length = cpu_to_le16(io.nblocks);
-	c.rw.control = cpu_to_le16(io.control);
-	c.rw.dsmgmt = cpu_to_le32(io.dsmgmt);
-	c.rw.reftag = cpu_to_le32(io.reftag);
-	c.rw.apptag = cpu_to_le16(io.apptag);
-	c.rw.appmask = cpu_to_le16(io.appmask);
-
-	return treenvme_submit_user_cmd(ns->queue, &c,
-			nvme_to_user_ptr(io.addr), length,
-			metadata, meta_len, lower_32_bits(io.slba), NULL, 0);
-}
-
-static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
-{
-	if (head)
-		srcu_read_unlock(&head->srcu, idx);
-}
-
-// blocktable
-static int register_block_table(struct treenvme_block_table __user *bt)
-{
-	counter = 0;
-	/*
-	// This is wrong.
-	tctx->bt->length_of_array = bt->length_of_array;
-	tctx->bt->smallest = bt->smallest;
-	tctx->bt->next_head = bt->next_head;
-	*/
-	copy_from_user(&tctx->bt->length_of_array, &bt->length_of_array, sizeof(int64_t));
-	copy_from_user(&tctx->bt->smallest, &bt->smallest, sizeof(int64_t));
-	copy_from_user(&tctx->bt->next_head, &bt->next_head, sizeof(int64_t));
-#ifdef DEBUG
-	printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
-	printk(KERN_ERR "Smallest element is: %u \n", tctx->bt->smallest);
-	printk(KERN_ERR "Next head is: %u \n", tctx->bt->next_head);	
-#endif
-#ifdef DEBUG
-	printk(KERN_ERR "PRINTING WHOLE BLOCK TABLE.\n");
-#endif
-
-	//void * user_ptr;
-	//user_ptr = bt->block_translation;
-#ifdef DEBUG
-	void * user_ptr;
-	user_ptr = bt->block_translation;
-	//printk(KERN_ERR "USERSPACE ADDRESS IS %u.\n", user_ptr);
-#endif
-	struct block_translation_pair *new_bp;
-	new_bp = kmalloc(sizeof(struct block_translation_pair *), GFP_KERNEL);
-	//tctx->bt->block_translation = kmalloc((sizeof (struct block_translation_pair *)), GFP_KERNEL);
-	//copy_from_user(&tctx->bt->block_translation, &bt->block_translation, sizeof(struct block_translation_pair *));	
-	copy_from_user(&new_bp, &bt->block_translation, sizeof(struct block_translation_pair *));
-		
-	tctx->bt->block_translation = kmalloc(sizeof(struct block_translation_pair) * tctx->bt->length_of_array, GFP_KERNEL);
-	int i = 0;
-	for (i = 0; i < tctx->bt->length_of_array; i++)
-	{
-		copy_from_user(&tctx->bt->block_translation[i], &new_bp[i], sizeof(struct block_translation_pair));
-#ifdef DEBUGMAX
-		printk(KERN_ERR "For blocknum %u", i);		
-		printk(KERN_ERR "OFFSET: %llx", tctx->bt->block_translation[i].u.diskoff);
-		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
-#endif	
-		if (!(tctx->bt->block_translation[i].size <= FREE && tctx->bt->block_translation[i].u.diskoff <= FREE))
-		{
-			tctx->bt->block_translation[i].size = -1;
-			tctx->bt->block_translation[i].u.diskoff = -1;
-		}
-	}
-#ifdef DEBUG
-	printk(KERN_ERR "Finish transferring.\n");
-	for (i = 0; i < tctx->bt->length_of_array; i++)
-	{
-		// free is a constant that tokudb uses to signify empty
-		if (tctx->bt->block_translation[i].size != -1 && tctx->bt->block_translation[i].size != 0)
-		{
-		printk(KERN_ERR "For blocknum %u", i);		
-		printk(KERN_ERR "OFFSET: %llx", tctx->bt->block_translation[i].u.diskoff);
-		printk(KERN_ERR "SIZE: %llu", tctx->bt->block_translation[i].size);
-		}
-	}
-#endif
-}
-
-int treenvme_ioctl(struct block_device *bdev, fmode_t mode,
-		unsigned int cmd, unsigned long arg)
-{
-	struct nvme_ns_head *head = NULL;
-	void __user *argp = (void __user *)arg;
-	struct nvme_ns *ns;
-	int srcu_idx, ret;
-
-	ns = bdev->bd_disk->private_data;
-	if (unlikely(!ns))
-		return -EWOULDBLOCK;
-
-	/*
-	 * Handle ioctls that apply to the controller instead of the namespace
-	 * seperately and drop the ns SRCU reference early.  This avoids a
-	 * deadlock when deleting namespaces using the passthrough interface.
-	 */
-	
-	/*
-	 * if (is_ctrl_ioctl(cmd))
-		return nvme_handle_ctrl_ioctl(ns, cmd, argp, head, srcu_idx);
-	*/
-#ifdef DEBUG
-	printk(KERN_ERR "Got into treenvme IOCTL.\n");
-#endif
-
-	switch (cmd) {
-	/*
-	case NVME_IOCTL_ID:
-		force_successful_syscall_return();
-		ret = ns->head->ns_id;
-		break;
-	*/
-	case TREENVME_IOCTL_IO_CMD:
-#ifdef DEBUG
-		printk(KERN_ERR "Submitted IO CMD through IOCTL.\n");
-#endif
-		//ret = nvme_user_cmd(ns->ctrl, ns, argp);
-		break;
-	case TREENVME_IOCTL_SUBMIT_IO:
-#ifdef DEBUG
-		printk(KERN_ERR "Submit IO through IOCTL process.\n");
-#endif
-		//ret = treenvme_submit_io(ns, argp);
-		break;
-	/*
-	case NVME_IOCTL_IO64_CMD:
-		ret = nvme_user_cmd64(ns->ctrl, ns, argp);
-		break;
-	*/
-	case TREENVME_IOCTL_SETUP:
-#ifdef DEBUG
-		printk(KERN_ERR "Setup nvme ioctl process.\n");
-#endif
-		ret = treenvme_setup_ctx(ns, argp);
-		break;
-	case TREENVME_IOCTL_REGISTER_BLOCKTABLE:
-#ifdef DEBUG
-		printk(KERN_ERR "Attempt to register blocktable. \n");
-#endif
-		ret = register_block_table(argp);
-		break;
-	default:
-		if (ns->ndev)
-			ret = nvme_nvm_ioctl(ns, cmd, arg);
-		else
-			ret = -ENOTTY;
-	}
-
-	nvme_put_ns_from_disk(head, srcu_idx);
-	return ret;
-}
-
-// end
-static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
-{
-	if (!nvmeq->qid)
-		return nvmeq->dev->admin_tagset.tags[0];
-	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
-}
-
-/*
-char *pass_leaf_to_user() {
-	
-}
-*/
-
-void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe)
+void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, volatile struct nvme_completion *cqe)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	//struct nvme_queue *nvmeq = iod->nvmeq;
@@ -546,15 +131,150 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 	struct nvme_dev *dev = iod->nvmeq->dev;
 	struct nvme_command cmnd;
 	blk_status_t ret;
+
+#ifdef SIMPLEBPF
+	struct bpf_prog *attached;
+	u32 result = 1;
+	attached = tctx ? rcu_dereference(tctx->ddp_prog) : NULL;
+	rcu_read_lock();
+	if (attached) {
+		printk("BPF Prog is being used!\n");
+		result = BPF_PROG_RUN(attached, bio_data(req->bio));
+		printk("Result of %d\n", result);
+	}
+	rcu_read_unlock();
+#endif
+
 	counter++;
+
+
+#ifdef SIMPLEKV
+	//if (req_op(req) && REQ_TREENVME)
+	//if (!op_is_write(req_op(req)))
+	if (req->bio->_imposter_count < req->bio->_imposter_level && !op_is_write(req_op(req)))
+	{
+	char *buffer = bio_data(req->bio);
+	int next_page;
+	next_page = page_match(req, buffer, 4096);
+	if (next_page == 0)
+	{
+#ifdef DEBUGS
+		printk(KERN_ERR "Got to leaf in %u with count %u\n", req->__sector, req->bio->_imposter_count);
+#endif
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		nvme_end_request(req, cqe->status, cqe->result);
+		return;
+	}
+	next_page = next_page & (~FILE_MASK);
+	req->bio->_imposter_count += 1;
+#ifdef DEBUGS
+	printk(KERN_ERR "Alter count is %lu\n", req->bio->_imposter_count);
+#endif
+	
+	ret = nvme_setup_cmd(ns, req, &cmnd);
+	if (ret)
+		printk(KERN_ERR "submit error\n");
+	//printk(KERN_ERR "Got here 2\n");x
+	if (blk_rq_nr_phys_segments(req)) {
+		ret = nvme_map_data(dev, req, &cmnd);
+		if (ret)
+			printk(KERN_ERR "mapping error\n");
+	}
+	if (blk_integrity_rq(req)) {
+		ret = nvme_map_metadata(dev, req, &cmnd);
+		if (ret)
+			printk(KERN_ERR "meta error\n");
+	}
+	
+	nvme_req(req)->cmd = &cmnd;
+	//cmnd.rw.slba = next_page / 2048;
+	req->bio->bi_iter.bi_sector = next_page / 512;
+	req->__sector = req->bio->bi_iter.bi_sector;
+	req->_imposter_command.rw.slba = cpu_to_le64(nvme_sect_to_lba(req->q->queuedata, blk_rq_pos(req)));
+	cmnd.rw.slba = cpu_to_le64(nvme_sect_to_lba(req->q->queuedata, blk_rq_pos(req)));
+#ifdef DEBUGS
+	printk(KERN_ERR "Next sector is %lu\n", req->__sector);
+#endif
+	//nvme_submit_cmd(nvmeq, &req->_imposter_command, true);
+	nvme_submit_cmd(nvmeq, &cmnd, true);
+	return; 
+	}
+	else {
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		printk(KERN_ERR "STATUS: %x\n", cqe->status);
+		ret = nvme_setup_cmd(ns, req, &cmnd);
+		//nvme_end_request(req, cqe->status, cqe->result);
+		nvme_end_request(req, 0, cqe->result);
+		return;
+	}
+#endif
+#ifdef TOKUDB
+	//if (req_op(req) && REQ_TREENVME)
+	//if (!op_is_write(req_op(req)))
+	if (req->bio->_imposter_count < req->bio->_imposter_level && !op_is_write(req_op(req)))
+	{
+	char *buffer = bio_data(req->bio);
+	int next_page;
+	next_page = page_match_tokudb(req, buffer, 4096);
+	if (next_page == 0)
+	{
+		printk(KERN_ERR "Got to leaf in %u with count %u\n", req->__sector, req->bio->_imposter_count);
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		nvme_end_request(req, cqe->status, cqe->result);
+		return;
+	}
+	next_page = next_page & (~FILE_MASK);
+	req->bio->_imposter_count += 1;
+#ifdef DEBUGS
+	printk(KERN_ERR "Alter count is %lu\n", req->bio->_imposter_count);
+#endif
+	
+	ret = nvme_setup_cmd(ns, req, &cmnd);
+	if (ret)
+		printk(KERN_ERR "submit error\n");
+	//printk(KERN_ERR "Got here 2\n");x
+	if (blk_rq_nr_phys_segments(req)) {
+		ret = nvme_map_data(dev, req, &cmnd);
+		if (ret)
+			printk(KERN_ERR "mapping error\n");
+	}
+	if (blk_integrity_rq(req)) {
+		ret = nvme_map_metadata(dev, req, &cmnd);
+		if (ret)
+			printk(KERN_ERR "meta error\n");
+	}
+	
+	nvme_req(req)->cmd = &cmnd;
+	//cmnd.rw.slba = next_page / 2048;
+	req->bio->bi_iter.bi_sector = next_page / 512;
+	req->__sector = req->bio->bi_iter.bi_sector;
+	req->_imposter_command.rw.slba = cpu_to_le64(nvme_sect_to_lba(req->q->queuedata, blk_rq_pos(req)));
+	cmnd.rw.slba = cpu_to_le64(nvme_sect_to_lba(req->q->queuedata, blk_rq_pos(req)));
+#ifdef DEBUGS
+	printk(KERN_ERR "Next sector is %lu\n", req->__sector);
+#endif
+	//nvme_submit_cmd(nvmeq, &req->_imposter_command, true);
+	nvme_submit_cmd(nvmeq, &cmnd, true);
+	return; 
+	}
+	else {
+		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		printk(KERN_ERR "STATUS: %x\n", cqe->status);
+		ret = nvme_setup_cmd(ns, req, &cmnd);
+		//nvme_end_request(req, cqe->status, cqe->result);
+		nvme_end_request(req, 0, cqe->result);
+		return;
+	}
+#endif
+#if 0
 	//printk(KERN_ERR "GOT HERE -- rebound \n");
-	if (req->alter_count < req->total_count && !op_is_write(req_op(req)))
+	if (req->bio->_imposter_count < req->bio->_imposter_level && !op_is_write(req_op(req)))
 	{
 #ifdef DEBUG
 		printk(KERN_ERR "alter count at: %u\n", req->alter_count);
 		printk(KERN_ERR "total count at: %u\n", req->total_count);
 #endif
-		req->alter_count += 1;
+		req->bio->_imposter_count += 1;
 		// alter
 		ret = nvme_setup_cmd(ns, req, &cmnd);
 		if (ret)
@@ -577,6 +297,7 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 		struct bio_vec bvec;
 		struct req_iterator iter;
 
+		uint64_t next_offset;
 		rq_for_each_segment(bvec, req, iter)
 		{
 			char *buffer = bio_data(req->bio);
@@ -594,8 +315,18 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 #ifdef TIME
 			printk("Time of %llu\n", ktime_get_ns() - time);
 #endif
+#ifdef SIMPLEKV
+			if (next_page == -1)
+				goto LEAF;
+			next_offset = next_page;
+			goto ENDING;
+#endif
+#ifdef SHORTCUT
+			goto LEAF;
+#endif
 			if (next_page == 0)
 				goto ERROR;
+#ifndef SIMPLEKV
 			if (!tctx->bt || !tctx->bt->block_translation)
 			{
 				printk(KERN_ERR "No block table when we want to do lookup.\n");
@@ -609,6 +340,7 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 				// we have a resulting leaf node
 				goto LEAF;	
 			}
+#endif
 #ifdef DEBUG
 			printk(KERN_ERR "NEXT PAGE IS %u\n", next_page);
 			printk(KERN_ERR "Length of array is: %llu \n", tctx->bt->length_of_array);
@@ -617,6 +349,10 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 
 #endif
 
+
+#ifdef DEBUG2
+			printk(KERN_ERR "NEXT PAGE IS %lu\n", next_page);
+#endif
 #ifdef DEBUGMAX	
 			int i = 0;
 			for (i = 0; i < tctx->bt->length_of_array; i++)
@@ -634,7 +370,6 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 				printk(KERN_ERR "Page is not in block array.");
 				goto ERROR;
 			}
-			uint64_t next_offset;
 			next_offset = tctx->bt->block_translation[next_page].u.diskoff;
 			if (next_offset == -1) 
 			{
@@ -644,6 +379,7 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 #ifdef DEBUG
 			printk(KERN_ERR "The next offset is %llu\n", next_offset);
 #endif
+//ENDING:
 			// cmnd.rw.slba = cpu_to_le64(nvme_lba_to_sect(ns, next_offset));
 			cmnd.rw.slba = cpu_to_le64(next_offset / 512);
 			req->__sector = cmnd.rw.slba;
@@ -656,7 +392,11 @@ void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struc
 			}
 			*/
 		}
+ENDING:
+		//req->alter_count++;
 		nvme_req(req)->cmd = &cmnd;
+		cmnd.rw.slba = cpu_to_le64(next_offset / 512);
+		req->__sector = cmnd.rw.slba;
 		nvme_submit_cmd(nvmeq, &cmnd, true);
 	}
 	else
@@ -670,20 +410,26 @@ ERROR:
 		}
 		*/
 		// just some final sanity check
-		printk(KERN_ERR "Final count is %u\n", req->alter_count);
-		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		//printk(KERN_ERR "Final count is %u\n", req->alter_count);
+		//req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
 		return;
 LEAF:
-	printk(KERN_ERR "Got to leaf in %u\n", req->__sector);
-	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
-	//pass_leaf_to_user();
+	printk(KERN_ERR "Got to leaf in %u with count %u\n", req->__sector, req->bio->_imposter_count);
+	//req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+	nvme_end_request(req, cqe->status, cqe->result);
+	return;
+//====
+FINAL:
+	printk(KERN_ERR "ERRNO reached!\n");
+	//req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 	nvme_end_request(req, cqe->status, cqe->result);
 	return;
 	}
+#endif
+
 }
 
-/*
 void init_pivot(struct pivot_bounds *pb, int num) {
 	pb->num_pivots = num;
 	pb->total_size = 0;
@@ -795,16 +541,22 @@ static int deserialize_basement(char *page, struct child_node_data *cnd)
 	i += key_data_size;
 }
 
+static void print_simple_node(ptr__t ptr, Node *node) {
+    size_t i = 0;
+    printk(KERN_ERR "----------------\n");
+    printk(KERN_ERR "ptr %lu num %lu type %lu\n", ptr, node->num, node->type);
+    for (i = 0; i < NODE_CAPACITY; i++) {
+	    printk(KERN_ERR "(%6lu, %8lu) ", node->key[i], node->ptr[i] & (~FILE_MASK));
+    }
+    printk(KERN_ERR "\n----------------\n");
+} 
+
 // Reference: toku_deserialize_bp_from_disk
 static int deserialize(struct request *req, char *page, struct tokunode *node) 
 {
-	struct block_data *bd;
-	// node->blocknum = blocknum;
-	node->blocknum = 0;
-	node->ct_pair = NULL;
-	int z = 0;
-
+	int i = 0;
 #ifdef DEBUGMAX
+	int z = 0;
 	for (z = 0; z < 512; z++){
 		if (page[z] != 0)
 		{
@@ -819,7 +571,80 @@ static int deserialize(struct request *req, char *page, struct tokunode *node)
 #endif
 #endif
 
-	int i = 0;
+
+#ifdef SIMPLEKV
+	struct _Node *nd = (struct _Node*)page;
+	
+#ifdef DEBUGS
+	print_simple_node(0, nd);
+	/*
+	printk(KERN_ERR "printing simple kv node:\n");
+	printk(KERN_ERR "node num: %d\n", nd->num);
+	printk(KERN_ERR "type: %d\n", nd->type);
+	printk(KERN_ERR "KEYS:\n");
+	for (i = 0; i < NODE_CAPACITY; i++) {
+		printk(KERN_ERR "%d", nd->key[i]);
+	}
+	*/
+#endif
+#ifdef KEYINBUF
+	unsigned long kk = req->bio->key;
+	//printk(KERN_ERR "KEY HERE IS %lu\n", kk);
+	if (nd->type != 1) {
+		//struct key_entry *_k;
+        	//_k = list_first_entry(&tctx->keys, struct key_entry, entry);	
+		for (i = 0; i < nd->num; i++) {
+			if(kk < nd->key[i]) {
+				return nd->ptr[i-1];
+			}
+		}
+		return nd->ptr[nd->num - 1];
+	}
+	else {
+	if (nd->type == 1) {
+#ifdef DEBUGS
+		// this is a leaf
+		printk(KERN_ERR "Got to leaf.\n");
+#endif
+		return 0;
+	}
+	else {
+		printk(KERN_ERR "Busted\n");
+		return 0;
+	     }
+	}
+#else	
+	if (nd->type != 1) {
+		struct key_entry *_k;
+        	_k = list_first_entry(&tctx->keys, struct key_entry, entry);	
+		for (i = 0; i < nd->num; i++) {
+			if(_k->a < nd->key[i]) {
+				return nd->ptr[i-1];
+			}
+		}
+		return nd->ptr[nd->num - 1];
+	}
+	else {
+	if (nd->type == 1) {
+#ifdef DEBUGS
+		// this is a leaf
+		printk(KERN_ERR "Got to leaf.\n");
+#endif
+		return 0;
+	}
+	else {
+		printk(KERN_ERR "Busted\n");
+		return 0;
+	     }
+	}
+#endif
+#else
+	struct block_data *bd;
+	// node->blocknum = blocknum;
+	node->blocknum = 0;
+	node->ct_pair = NULL;
+
+
 	int j; 
 	int k;
 	int l;
@@ -887,7 +712,13 @@ static int deserialize(struct request *req, char *page, struct tokunode *node)
 
 	// uncompressed size
 	memcpy(&sb_data->usize, &page[i], 4);
-	i += 4;
+	i += 4;	
+	/*
+	for (j = 0; i < 400; j++) {
+		memcpy(&sb_data.usize, &page[i], 4);
+		i += 4;
+	}
+	*/
 
 #ifdef DEBUG
 	printk("COMPRESSED_SIZE: %u\n", sb_data->csize);
@@ -942,16 +773,6 @@ static int deserialize(struct request *req, char *page, struct tokunode *node)
 	printk("Node flags of %u\n", node->flags);
 	printk("Node height of %u\n", node->height);
 #endif
-		if (node->height > req->total_count) {
-			// safety feature
-			if (node->height > 16)
-			       req->total_count = 16;	
-			else
-			       req->total_count = node->height;
-#ifdef DEBUG
-	printk("Changed total count to %u\n", req->total_count);
-#endif
-		}
 		k += 12;
 		node->pivotkeys = kmalloc(sizeof(struct pivot_bounds), GFP_KERNEL); 
 		if (node->n_children > 1){
@@ -1014,6 +835,7 @@ static int deserialize(struct request *req, char *page, struct tokunode *node)
 		k += 16;
 		goto ERROR;
 	}
+#endif
 ERROR:
 	return -1;	
 }
@@ -1033,8 +855,66 @@ static int example_compare(char *a, char *b, int asize, int bsize)
 	return -1;	
 }
 
+static int page_match_tokudb(struct request *req, char *page, int page_size)
+{
+	struct tokunode *node = kmem_cache_alloc(node_cachep, GFP_KERNEL);
+	int is_child = 0;
+	int result;
+	result = deserialize(req, page, node);
+	if (result == -1)
+		return -1;
+	if (result == -2)
+		is_child = 1;
+
+	int low = 0;
+	int high = node->n_children - 1;
+	int middle;
+	struct DBT pivot_key;
+	init_DBT(&pivot_key);
+
+	struct search_ctx *search = kmalloc(sizeof(struct search_ctx), GFP_KERNEL);
+
+	if (is_child == 0) {	
+		// this is only a test?
+		search->compare = &example_compare;
+		while (low < high)
+		{
+			middle = (low + high) / 2;	
+			bool c = compare(search, &node->pivotkeys->dbt_keys[low], &node->pivotkeys->dbt_keys[high]);
+			if (((search->direction == LEFT_TO_RIGHT) && c) || (search->direction == RIGHT_TO_LEFT && !c))
+			{	
+				high = middle;
+			}
+			else {
+				low = middle + 1;
+			}
+			break;		
+		}
+	}
+	else {
+		// This means that we are dealing with a leaf node.
+		return -2;
+	}
+#ifdef DEBUG
+	if (!node)
+		printk(KERN_ERR "Node is NULL\n");
+#endif
+
+	if (result == 1)
+	{
+		return (node)->cnd[low].blocknum;	
+	}
+	if (result == 0)
+	{
+		return 0;
+	}
+}
+
 static int page_match(struct request *req, char *page, int page_size)
 {
+#ifdef DEBUG2
+	printk(KERN_ERR "Got into page_match.\n");
+#endif
 	struct tokunode *node = kmem_cache_alloc(node_cachep, GFP_KERNEL);
 	
 	int is_child = 0;
@@ -1043,6 +923,12 @@ static int page_match(struct request *req, char *page, int page_size)
 	uint64_t dstime = ktime_get_ns();
 #endif
 	result = deserialize(req, page, node);
+#ifdef SIMPLEKV
+#ifdef DEBUG2
+	printk(KERN_ERR "End result of %lu\n", result);
+#endif
+	return result;
+#endif
 #ifdef TIME
 	printk(KERN_ERR "Deserialize time: %llu\n", ktime_get_ns() - dstime);
 #endif
@@ -1096,842 +982,8 @@ static int page_match(struct request *req, char *page, int page_size)
 		return 0;
 	}
 }
-*/
 
 /*
-static int
-ft_search_node_cutdown (
-    FT_HANDLE ft_handle,
-    struct _ftnode *node,
-    ft_search *search,
-    int child_to_search,
-    FT_GET_CALLBACK_FUNCTION getf,
-    void *getf_v,
-    bool *doprefetch,
-    FT_CURSOR ftcursor,
-    UNLOCKERS unlockers,
-    struct _ancestors *ans,
-    const pivot_bounds &bounds,
-    bool can_bulk_fetch
-    );
-
-static int page_match(struct request *req, char *page, int page_size)
-{
-	struct _ftnode *_node = NULL;
-	CACHEKEY root_key;
-	toku_calculate_root_offset_pointer(ft, &root_key, &fullhash);
-	_CACHEKEY new_key = { .b = root_key.b };
-	toku_pin_ftnode_cutdown(
-		ft,
-		new_key,
-		fullhash,
-		&bfe,
-		PL_READ,
-		&_node,
-		true
-		);
-
-	uint tree_height = _node->height + 1;
-
-	struct unlock_ftnode_extra unlock_extra = { ft_handle, node, false };
-	struct unlockers unlockers = { true, unlock_ftnode_fun, (void*)&unlock_extra, (UNLOCKERS)NULL};
-
-	{
-		bool doprefetch = false;
-			
-		//static int counter = 0;         counter++;
-		r = ft_search_node_cutdown(ft_handle, _node, search, bfe.child_to_read, getf, getf_v, &doprefetch, ftcursor, &unlockers, (struct _ancestors*)NULL, pivot_bounds::infinite_bounds(), can_bulk_fetch);
-		if (r==TOKUDB_TRY_AGAIN) {
-		    // there are two cases where we get TOKUDB_TRY_AGAIN
-		    //  case 1 is when some later call to toku_pin_ftnode returned
-		    //  that value and unpinned all the nodes anyway. case 2
-		    //  is when ft_search_node had to stop its search because
-		    //  some piece of a node that it needed was not in memory.
-		    //  In this case, the node was not unpinned, so we unpin it here
-		    if (unlockers.locked) {
-			toku_unpin_ftnode_read_only_cutdown(ft_handle->ft, _node);
-		    }
-		    goto try_again;
-		} else {
-		    assert(unlockers.locked);
-		}
-	    }
-
-	    assert(unlockers.locked);
-	    toku_unpin_ftnode_read_only_cutdown(ft_handle->ft, _node);
-	}
-
-}
-
-static int
-ft_search_node_cutdown(
-    FT_HANDLE ft_handle,
-    struct _ftnode *node,
-    ft_search *search,
-    int child_to_search,
-    FT_GET_CALLBACK_FUNCTION getf,
-    void *getf_v,
-    bool *doprefetch,
-    FT_CURSOR ftcursor,
-    UNLOCKERS unlockers,
-    struct _ancestors *ancestors,
-    const pivot_bounds &bounds,
-    bool can_bulk_fetch
-    )
-{
-    int r = 0;
-    invariant(child_to_search >= 0);
-    invariant(child_to_search < node->n_children);
-    //assert(BP_STATE(node,child_to_search) == PT_AVAIL);
-    const pivot_bounds next_bounds = bounds.next_bounds(cast_from__ftnode(node), child_to_search);
-    if (node->height > 0) {
-        r = ft_search_child_cutdown(
-            ft_handle,
-            node,
-            child_to_search,
-            search,
-            getf,
-            getf_v,
-            doprefetch,
-            ftcursor,
-            unlockers,
-            ancestors,
-            next_bounds,
-            can_bulk_fetch
-            );
-    }
-    else {
-	// return basementnode 
-        r = ft_search_basement_node_cutdown(
-            BLB(cast_from__ftnode(node), child_to_search),
-            search,
-            getf,
-            getf_v,
-            doprefetch,
-            ftcursor,
-            can_bulk_fetch
-            );
-    }
-    if (r == 0) {
-        return r; //Success
-    }
-
-    if (r != DB_NOTFOUND) {
-        return r; //Error (or message to quit early, such as TOKUDB_FOUND_BUT_REJECTED or TOKUDB_TRY_AGAIN)
-    }
-    // not really necessary, just put this here so that reading the
-    // code becomes simpler. The point is at this point in the code,
-    // we know that we got DB_NOTFOUND and we have to continue
-    assert(r == DB_NOTFOUND);
-    // we have a new pivotkey
-    if (node->height == 0) {
-        // when we run off the end of a basement, try to lock the range up to the pivot. solves #3529
-        const DBT *pivot = search->direction == FT_SEARCH_LEFT ? next_bounds.ubi() : // left -> right
-                                                                 next_bounds.lbe();  // right -> left
-        if (pivot != nullptr) {
-            int rr = getf(pivot->size, pivot->data, 0, nullptr, getf_v, true);
-            if (rr != 0) {
-                return rr; // lock was not granted
-            }
-        }
-    }
-}
-
-// search in a node's child
-static int
-ft_search_child_cutdown(FT_HANDLE ft_handle, struct _ftnode *node, int childnum, ft_search *search, FT_GET_CALLBACK_FUNCTION getf, void *getf_v, bool *doprefetch, FT_CURSOR ftcursor, UNLOCKERS unlockers, struct _ancestors *ancestors, const pivot_bounds &bounds, bool can_bulk_fetch)
-// Effect: Search in a node's child.  Searches are read-only now (at least as far as the hardcopy is concerned).
-{
-    struct _ancestors next_ancestors = {node, childnum, ancestors};
-
-    _BLOCKNUM childblocknum = BP_BLOCKNUM(node,childnum);
-    uint32_t fullhash = compute_child_fullhash_cutdown(ft_handle->ft->cf, node, childnum);
-    struct _ftnode *childnode = nullptr;
-
-    // If the current node's height is greater than 1, then its child is an internal node.
-    // Therefore, to warm the cache better (#5798), we want to read all the partitions off disk in one shot.
-    bool read_all_partitions = node->height > 1;
-    ftnode_fetch_extra bfe;
-    bfe.create_for_subset_read(
-        ft_handle->ft,
-        search,
-        &ftcursor->range_lock_left_key,
-        &ftcursor->range_lock_right_key,
-        ftcursor->left_is_neg_infty,
-        ftcursor->right_is_pos_infty,
-        ftcursor->disable_prefetching,
-        read_all_partitions
-        );
-    bool msgs_applied = false;
-    {
-        int rr = toku_pin_ftnode_for_query(ft_handle, *(BLOCKNUM *)&childblocknum, fullhash,
-                                         unlockers,
-                                         (ANCESTORS)&next_ancestors, bounds,
-                                         &bfe,
-                                         true,
-                                         (FTNODE *)&childnode,
-                                         &msgs_applied);
-        if (rr==TOKUDB_TRY_AGAIN) {
-            return rr;
-        }
-        invariant_zero(rr);
-    }
-
-    struct unlock_ftnode_extra unlock_extra = { ft_handle, cast_from__ftnode(childnode), msgs_applied };
-    struct unlockers next_unlockers = { true, unlock_ftnode_fun, (void *) &unlock_extra, unlockers };
-    int r = ft_search_node_cutdown(ft_handle, childnode, search, bfe.child_to_read, getf, getf_v, doprefetch, ftcursor, &next_unlockers, &next_ancestors, bounds, can_bulk_fetch);
-    if (r!=TOKUDB_TRY_AGAIN) {
-        // maybe prefetch the next child
-        //if (r == 0 && node->height == 1) {
-        //    ft_node_maybe_prefetch(ft_handle, cast_from__ftnode(node), childnum, ftcursor, doprefetch);
-        //}
-
-        assert(next_unlockers.locked);
-        if (msgs_applied) {
-            toku_unpin_ftnode(ft_handle->ft, cast_from__ftnode(childnode));
-        }
-        else {
-            toku_unpin_ftnode_read_only(ft_handle->ft, cast_from__ftnode(childnode));
-        }
-    } else {
-        // try again.
-
-        // there are two cases where we get TOKUDB_TRY_AGAIN
-        //  case 1 is when some later call to toku_pin_ftnode returned
-        //  that value and unpinned all the nodes anyway. case 2
-        //  is when ft_search_node had to stop its search because
-        //  some piece of a node that it needed was not in memory. In this case,
-        //  the node was not unpinned, so we unpin it here
-        if (next_unlockers.locked) {
-            if (msgs_applied) {
-                toku_unpin_ftnode(ft_handle->ft, cast_from__ftnode(childnode));
-            }
-            else {
-                toku_unpin_ftnode_read_only(ft_handle->ft, cast_from__ftnode(childnode));
-            }
-        }
-    }
-
-    return r;
-}
-
-int
-toku_pin_ftnode_for_query(
-    FT_HANDLE ft_handle,
-    BLOCKNUM blocknum,
-    uint32_t fullhash,
-    UNLOCKERS unlockers,
-    ANCESTORS ancestors,
-    const pivot_bounds &bounds,
-    ftnode_fetch_extra *bfe,
-    bool apply_ancestor_messages, // this bool is probably temporary, for #3972, once we know how range query estimates work, will revisit this
-    FTNODE *node_p,
-    bool* msgs_applied)
-{
-    void *node_v;
-    *msgs_applied = false;
-    FTNODE node = nullptr;
-    MSN max_msn_in_path = ZERO_MSN;
-    bool needs_ancestors_messages = false;
-    // this function assumes that if you want ancestor messages applied,
-    // you are doing a read for a query. This is so we can make some optimizations
-    // below.
-    if (apply_ancestor_messages) {
-        paranoid_invariant(bfe->type == ftnode_fetch_subset);
-    }
-    
-    int r = toku_cachetable_get_and_pin_nonblocking(
-            ft_handle->ft->cf,
-            blocknum,
-            fullhash,
-            &node_v,
-            get_write_callbacks_for_node(ft_handle->ft),
-            toku_ftnode_fetch_callback,
-            toku_ftnode_pf_req_callback,
-            toku_ftnode_pf_callback,
-            PL_READ,
-            bfe, //read_extraargs
-            unlockers);
-    if (r != 0) {
-        assert(r == TOKUDB_TRY_AGAIN); // Any other error and we should bomb out ASAP.
-        goto exit;
-    }
-    node = static_cast<FTNODE>(node_v);
-    if (apply_ancestor_messages && node->height == 0) {
-        needs_ancestors_messages = toku_ft_leaf_needs_ancestors_messages(
-            ft_handle->ft, 
-            node, 
-            ancestors, 
-            bounds, 
-            &max_msn_in_path, 
-            bfe->child_to_read
-            );
-        if (needs_ancestors_messages) {
-            toku::context apply_messages_ctx(CTX_MESSAGE_APPLICATION);
-
-            toku_unpin_ftnode_read_only(ft_handle->ft, node);
-            int rr = toku_cachetable_get_and_pin_nonblocking(
-                 ft_handle->ft->cf,
-                 blocknum,
-                 fullhash,
-                 &node_v,
-                 get_write_callbacks_for_node(ft_handle->ft),
-                 toku_ftnode_fetch_callback,
-                 toku_ftnode_pf_req_callback,
-                 toku_ftnode_pf_callback,
-                 PL_WRITE_CHEAP,
-                 bfe, //read_extraargs
-                 unlockers);
-            if (rr != 0) {
-                assert(rr == TOKUDB_TRY_AGAIN);
-                r = TOKUDB_TRY_AGAIN;
-                goto exit;
-            }
-            node = static_cast<FTNODE>(node_v);
-            toku_apply_ancestors_messages_to_node(
-                ft_handle, 
-                node, 
-                ancestors, 
-                bounds, 
-                msgs_applied,
-                bfe->child_to_read
-                );
-        } else {
-            if (!node->dirty()) {
-                toku_ft_bn_update_max_msn(node, max_msn_in_path, bfe->child_to_read);
-            }
-        }
-    }
-    *node_p = node;
-exit:
-    return r;
-}
-
-int toku_cachetable_get_and_pin_nonblocking(
-    CACHEFILE cf,
-    CACHEKEY key,
-    uint32_t fullhash,
-    void**value,
-    CACHETABLE_WRITE_CALLBACK write_callback,
-    CACHETABLE_FETCH_CALLBACK fetch_callback,
-    CACHETABLE_PARTIAL_FETCH_REQUIRED_CALLBACK pf_req_callback,
-    CACHETABLE_PARTIAL_FETCH_CALLBACK pf_callback,
-    pair_lock_type lock_type,
-    void *read_extraargs,
-    UNLOCKERS unlockers
-    )
-// See cachetable/cachetable.h.
-{
-    CACHETABLE ct = cf->cachetable;
-    assert(lock_type == PL_READ ||
-        lock_type == PL_WRITE_CHEAP ||
-        lock_type == PL_WRITE_EXPENSIVE
-        );
-try_again:
-    ct->list.pair_lock_by_fullhash(fullhash);
-    PAIR p = ct->list.find_pair(cf, key, fullhash);
-    if (p == NULL) {
-        toku::context fetch_ctx(CTX_FULL_FETCH);
-
-        // Not found
-        ct->list.pair_unlock_by_fullhash(fullhash);
-        ct->list.write_list_lock();
-        ct->list.pair_lock_by_fullhash(fullhash);
-        p = ct->list.find_pair(cf, key, fullhash);
-        if (p != NULL) {
-            // we just did another search with the write list lock and 
-            // found the pair this means that in between our 
-            // releasing the read list lock and grabbing the write list lock,
-            // another thread snuck in and inserted the PAIR into
-            // the cachetable. For simplicity, we just return
-            // to the top and restart the function
-            ct->list.write_list_unlock();
-            ct->list.pair_unlock_by_fullhash(fullhash);
-            goto try_again;
-        }
-
-        p = cachetable_insert_at(
-            ct,
-            cf,
-            key,
-            zero_value,
-            fullhash,
-            zero_attr,
-            write_callback,
-            CACHETABLE_CLEAN
-            );
-        assert(p);
-        // grab expensive write lock, because we are about to do a fetch
-        // off disk
-        // No one can access this pair because
-        // we hold the write list lock and we just injected
-        // the pair into the cachetable. Therefore, this lock acquisition
-        // will not block.
-        p->value_rwlock.write_lock(true);
-        pair_unlock(p);
-        run_unlockers(unlockers); // we hold the write list_lock.
-        ct->list.write_list_unlock();
-
-        // at this point, only the pair is pinned,
-        // and no pair mutex held, and 
-        // no list lock is held
-        uint64_t t0 = get_tnow();
-        cachetable_fetch_pair(ct, cf, p, fetch_callback, read_extraargs, false);
-        cachetable_miss++;
-        cachetable_misstime += get_tnow() - t0;
-
-        if (ct->ev.should_client_thread_sleep()) {
-            ct->ev.wait_for_cache_pressure_to_subside();
-        }
-        if (ct->ev.should_client_wake_eviction_thread()) {
-            ct->ev.signal_eviction_thread();
-        }
-
-        return TOKUDB_TRY_AGAIN;
-    }
-}
-
-static void cachetable_fetch_pair(
-    CACHETABLE ct, 
-    CACHEFILE cf, 
-    PAIR p, 
-    CACHETABLE_FETCH_CALLBACK fetch_callback, 
-    void* read_extraargs,
-    bool keep_pair_locked
-    ) 
-{
-    // helgrind
-    CACHEKEY key = p->key;
-    uint32_t fullhash = p->fullhash;
-
-    void *toku_value = NULL;
-    void *disk_data = NULL;
-    PAIR_ATTR attr;
-    
-    // FIXME this should be enum cachetable_dirty, right?
-    int dirty = 0;
-
-    pair_lock(p);
-    nb_mutex_lock(&p->disk_nb_mutex, p->mutex);
-    pair_unlock(p);
-
-    int r;
-    r = fetch_callback(cf, p, cf->fd, key, fullhash, &toku_value, &disk_data, &attr, &dirty, read_extraargs);
-    if (dirty) {
-        p->dirty = CACHETABLE_DIRTY;
-    }
-    assert(r == 0);
-
-    p->value_data = toku_value;
-    p->disk_data = disk_data;
-    p->attr = attr;
-    ct->ev.add_pair_attr(attr);
-    pair_lock(p);
-    nb_mutex_unlock(&p->disk_nb_mutex);
-    if (!keep_pair_locked) {
-        p->value_rwlock.write_unlock();
-    }
-    pair_unlock(p);
-}
-*/
-
-static struct _ftnode *alloc__ftnode_for_deserialize(uint32_t fullhash, _BLOCKNUM blocknum) {
-// Effect: Allocate an FTNODE and fill in the values that are not read from
-    struct _ftnode *MMALLOC(node);
-    node->fullhash = fullhash;
-    node->blocknum = blocknum;
-    //node->clear_dirty();
-    node->oldest_referenced_xid_known = 0;
-    node->bp = NULL;
-    node->ct_pair = NULL;
-    return node; 
-}
-
-static void
-setup_available_ftnode_partition_cutdown(struct _ftnode *node, int i) {
-    if (node->height == 0) {
-        //set_BLB(cast_from__ftnode(node), i, toku_create_empty_bn());
-	//MSN m = { .msn = node->max_msn_applied_to_node_on_disk.msn };
-        //BLB_MAX_MSN_APPLIED(node,i) = (MSN)m;
-#ifdef DEBUG
-	printk("Got into leaf node.\n");
-#endif
-    }
-    else {
-        //set_BNC(cast_from__ftnode(node), i, toku_create_empty_nl());
-    }
-#ifdef DEBUG
-	dump_ftnode_cutdown(node);
-#endif
-}
-
-void setup_ftnode_partitions_cutdown(struct _ftnode* node, struct ftnode_fetch_extra *bfe, bool data_in_memory) {
-        int i = 0;
-	if (bfe->type == ftnode_fetch_subset) {
-		struct _comparator cmp;
-		init_comparator(&cmp);
-                bfe->child_to_read = _search_which_child(&cmp, node, bfe->search);
-        }
-        // setup_partitions_using_bfe
-        // https://github.com/percona/PerconaFT/blob/d627ac564ae11944a363e18749c9eb8291b8c0ac/ft/serialize/ft_node-serialize.cc
-        int lc, rc;
-        if (bfe->type == ftnode_fetch_subset)
-        {
-                lc = leftmost_child_wanted(bfe, node);
-                rc = rightmost_child_wanted(bfe, node);
-        }
-
-        for (i = 0; i < node->n_children; i++) {
-                BP_INIT_UNTOUCHED_CLOCK(node,i);
-                if (data_in_memory) {
-                        BP_STATE(node, i) = (((lc <= i && i <= rc))
-                                 ? _PT_AVAIL : _PT_COMPRESSED);
-                } else {
-                        BP_STATE(node, i) = _PT_ON_DISK;
-                }
-                BP_WORKDONE(node,i) = 0;
-
-                switch (BP_STATE(node,i)) {
-                case _PT_AVAIL:
-                        setup_available_ftnode_partition_cutdown(node, i);
-                        //BP_TOUCH_CLOCK(node,i);
-                        break;
-                case _PT_COMPRESSED:
-                        //set_BSB(node, i, sub_block_creat());
-                        break;
-                case _PT_ON_DISK:
-                        //set_BNULL(node, i);
-                        break;
-                case _PT_INVALID:
-                        //abort();
-			break;
-                }
-        }
-}
-
-static int deserialize_ftnode_partition_cutdown(
-    struct _sub_block *sb,
-    struct _ftnode *node,
-    int childnum,  // which partition to deserialize
-    struct _comparator *cmp) {
-
-    int r = 0;
-    uint32_t data_size;
-    data_size = sb->uncompressed_size - 4; // checksum is 4 bytes at end
-
-    //NOTE: Checksum stuff missing.
-    // now with the data verified, we can read the information into the node
-    struct rbuf rb;
-    _rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
-    unsigned char ch;
-    ch = _rbuf_int(&rb);
-
-/*
-#ifdef DEBUG
-	dump_ftnode_child_ptr_cutdown(&node->bp->ptr);
-#endif
-*/
-    /*
-    if (node->height > 0) {
-        if (ch != FTNODE_PARTITION_MSG_BUFFER) {
-            	printk("not partition");
-		assert(ch == FTNODE_PARTITION_MSG_BUFFER);
-        }
-       	struct ftnode_nonleaf_childinfo *bnc = BNC(cast_from__ftnode(node), childnum);
-        if (node->layout_version_read_from_disk <= FT_LAYOUT_VERSION_26) {
-            // Layout version <= 26 did not serialize sorted message trees to disk.
-            deserialize_child_buffer_v26(bnc, &rb, cmp);
-        } else {
-            deserialize_child_buffer(bnc, &rb);
-        }
-        BP_WORKDONE(node, childnum) = 0;
-    } else {
-        if (ch != FTNODE_PARTITION_DMT_LEAVES) {
-            fprintf(stderr,
-                    "%s:%d:deserialize_ftnode_partition - "
-                    "file[%s], blocknum[%ld], ch[%d] != "
-                    "FTNODE_PARTITION_DMT_LEAVES[%d]\n",
-                    __FILE__,
-                    __LINE__,
-                    fname ? fname : "unknown",
-                    node->blocknum.b,
-                    ch,
-                    FTNODE_PARTITION_DMT_LEAVES);
-            dump_bad_block(rb.buf, rb.size);
-            assert(ch == FTNODE_PARTITION_DMT_LEAVES);
-        }
-	printk("Number of children at this point is %u\n", node->n_children);
-        printk("Did we even get here?\n");
-	struct ftnode hn;
-	memcpy(&hn, node, sizeof(struct ftnode));
-#ifdef DEBUG
-	printk("==================SIZECOMPARISON===============");
-	printk("Size is %u for _node and %u for node\n", sizeof(struct _ftnode), sizeof(struct ftnode));
-	printk("Num child is %u for _node and %u for node\n", (cast_from__ftnode(node))->n_children, node->n_children);
-	compare_ftnode_and__ftnode(cast_from__ftnode(node), node); 
-	//compare_ftnode_and__ftnode(&hn, node); 
-#endif
-        BLB_SEQINSERT(cast_from__ftnode(node), childnum) = 0;
-        uint32_t num_entries = rbuf_int(&rb);
-        // we are now at the first byte of first leafentry
-#ifdef DEBUG
-	dump_ftnode_cutdown(node);
-#endif
-        data_size -= rb.ndone; // remaining bytes of leafentry data
-	BASEMENTNODE bn = BLB(cast_from__ftnode(node), childnum);
-        bn->data_buffer.deserialize_from_rbuf(
-            num_entries, &rb, data_size, node->layout_version_read_from_disk);
-    }
-    if (rb.ndone != rb.size) {
-        fprintf(stderr,
-                "%s:%d:deserialize_ftnode_partition - "
-                "file[%s], blocknum[%ld], rb.ndone[%d] != rb.size[%d]\n",
-                __FILE__,
-                __LINE__,
-                fname ? fname : "unknown",
-                node->blocknum.b,
-                rb.ndone,
-                rb.size);
-        dump_bad_block(rb.buf, rb.size);
-        assert(rb.ndone == rb.size);
-    }
-    */
-
-exit:
-    return r;
-}
-static int decompress_and_deserialize_worker_cutdown(struct rbuf curr_rbuf,
-                                             struct _sub_block curr_sb,
-                                             struct _ftnode *node,
-                                             int child,
-                                             struct _comparator *cmp) {
-    int r = 0;
-    r = read_and_decompress_sub_block_cutdown(&curr_rbuf, &curr_sb);
-    if (r != 0) {
-	printk("Decompress and deserialize broke.\n");        
-	goto exit;
-    }
-#ifdef DEBUG 
-    dump_sub_block(&curr_sb);
-#endif
-    // at this point, sb->uncompressed_ptr stores the serialized node partition
-    r = deserialize_ftnode_partition_cutdown(&curr_sb, node, child, cmp);
-    if (r != 0) {
-        printk("Deserialize ftnode partition broke.\n");
-	goto exit;
-    }
-
-exit:
-    kfree(curr_sb.uncompressed_ptr);
-    return r;
-}
-
-int check_and_copy_compressed_sub_block_worker_cutdown(struct rbuf curr_rbuf,
-                                                      struct _sub_block curr_sb,
-                                                      struct _ftnode *node,
-                                                      int child) {
-    int r = 0;
-    r = read_compressed_sub_block_cutdown(&curr_rbuf, &curr_sb);
-    if (r != 0) {
-        goto exit;
-    }
-
-    struct _sub_block *bp_sb;
-    bp_sb = BSB(node, child);
-    bp_sb->compressed_size = curr_sb.compressed_size;
-    bp_sb->uncompressed_size = curr_sb.uncompressed_size;
-    bp_sb->compressed_ptr = _mmalloc(bp_sb->compressed_size);
-    memcpy(
-        bp_sb->compressed_ptr, curr_sb.compressed_ptr, bp_sb->compressed_size);
-exit:
-    return r;
-}
-
-int deserialize_ftnode_info_cutdown(struct _sub_block *sb, struct _ftnode *node) {
-    int r = 0;
-    int i = 0;
-#ifdef DEBUG
-    dump_ftnode_cutdown(node);
-#endif
-    uint32_t data_size;
-    data_size = sb->uncompressed_size - 4; // checksum is 4 bytes at end
-
-    struct rbuf rb;
-    _rbuf_init(&rb, (unsigned char *) sb->uncompressed_ptr, data_size);
-
-    _MSN tmsn = _rbuf_MSN(&rb);
-    node->max_msn_applied_to_node_on_disk = tmsn;
-    (void)_rbuf_int(&rb);
-    node->flags = _rbuf_int(&rb);
-    node->height = _rbuf_int(&rb);
-
-    // version 19
-    if (node->layout_version_read_from_disk < 19) {
-        (void) _rbuf_int(&rb); // optimized_for_upgrade
-    }
-
-    // version 22
-    if (node->layout_version_read_from_disk >= 22) {
-        _rbuf_TXNID(&rb, &node->oldest_referenced_xid_known);
-    }
-    if (node->n_children > 1) {
-        deserialize_from_rbuf_cutdown(&node->pivotkeys, &rb, node->n_children - 1);
-    } else {
-        _create_empty_pivot(&node->pivotkeys);
-    }
-    if (node->height > 0) {
-        for (i = 0; i < node->n_children; i++) {
-	    _BLOCKNUM _bn = _rbuf_blocknum(&rb);
-            _BP_BLOCKNUM(node, i) = _bn;
-            _BP_WORKDONE(node, i) = 0;
-        }
-    }
-    if (data_size != rb.ndone) {
-    	printk("Bad data size in ftnode info.\n"); 
-    }
-exit:
-    return r;
-}
-
-
-#define malloc(size) kmalloc(size, GFP_KERNEL)
-// deserialize_ftnode_from_rbuf_cutdown
-// read_ftnode_header_from_fd_into_rbuf_if_small_enough_cutdown
-// deserialize_ftnode_header_from_rbuf_if_small_enough_cutdown
-static int page_match(struct request *req, char *page, int page_size)
-{	
-	int r = 0;	
-	struct _sub_block sb_node_info;
-	struct ftnode_disk_data *ndd;
-	int i = 0;
-#ifdef FAKE
-	int fullhash = 3000;
-	_BLOCKNUM blocknum = { .b = 3 };
-#endif
-	struct rbuf *rb = malloc(sizeof(struct rbuf));
-	_rbuf_init(rb, page, page_size);
-
-	struct _ftnode *node = alloc__ftnode_for_deserialize(fullhash, blocknum); 
-	// bfe->ft->blocktable.translate_blocknum_to_offset_size_cutdown(blocknum, &offset, &size);
-	node->fullhash = fullhash;
-	node->blocknum = blocknum;
-	node->oldest_referenced_xid_known = 0;
-    node->bp = NULL;
-    node->ct_pair = NULL;	
-    
-	const void *magic;
-    _rbuf_literal_bytes(rb, &magic, 8);
-    if (memcmp(magic, "tokuleaf", 8) != 0 &&
-        memcmp(magic, "tokunode", 8) != 0) {
-	printk("First 8 magic bytes broken.\n");
-        goto cleanup;
-    }
-
-    node->layout_version_read_from_disk = _rbuf_int(rb);
-
-    // Check if we are reading in an older node version.
-    if (node->layout_version_read_from_disk <= FT_LAYOUT_VERSION_14) {
-        printk("Layout_version broken.");
-	goto cleanup;
-    }
-
-    node->layout_version = node->layout_version_read_from_disk;
-    node->layout_version_original = _rbuf_int(rb);
-    node->build_id = _rbuf_int(rb);
-    node->n_children = _rbuf_int(rb);
-    MMALLOC_N(node->n_children, node->bp);
-    MMALLOC_N(node->n_children, ndd);
-    // read the partition locations
-    for (i=0; i<node->n_children; i++) {
-        BP_START(ndd,i) = _rbuf_int(rb);
-        BP_SIZE (ndd,i) = _rbuf_int(rb);
-    }
-    // verify checksum of header stored
-    uint32_t checksum;
-    //checksum = toku_x1764_memory(rb->buf, rb->ndone);
-    uint32_t stored_checksum;
-    stored_checksum = _rbuf_int(rb);
-    /*
-    if (stored_checksum != checksum) {
-    	printk("Bad checksum.\n");
-    }
-    */
-
-    sub_block_init_cutdown(&sb_node_info);
-    {
-        r = read_compressed_sub_block_cutdown(rb, &sb_node_info);
-        if (r != 0) {
-       		printk("Read and decompress messed up.\n");
-		goto cleanup;
-	}
-    }
-
-    r = deserialize_ftnode_info_cutdown(&sb_node_info, node);
-    if (r != 0) {
-        goto cleanup;
-    }
-    kfree(sb_node_info.uncompressed_ptr);
-    struct ftnode_fetch_extra bfe;
-    init_ffe(&bfe);
-    setup_ftnode_partitions_cutdown(node, &bfe, true);
-
-    for (i = 0; i < node->n_children; i++) {
-        uint32_t curr_offset = BP_START(ndd, i);
-        uint32_t curr_size = BP_SIZE(ndd, i);
-        struct rbuf curr_rbuf = {.buf = NULL, .size = 0, .ndone = 0};
-        _rbuf_init(&curr_rbuf, rb->buf + curr_offset, curr_size);
-
-        struct _sub_block curr_sb;
-        sub_block_init_cutdown(&curr_sb);
-	struct _comparator cmp;
-	init_comparator(&cmp);
-        switch (BP_STATE(node, i)) {
-            case _PT_AVAIL: {
-                //  case where we read and decompress the partition
-                r = decompress_and_deserialize_worker_cutdown(
-                    curr_rbuf,
-                    curr_sb,
-                    node,
-                    i,
-                    &cmp);
-                if (r != 0) {
-                    printk("decompress broke.\n");
-                    goto cleanup;
-                }
-                break;
-            }
-        case _PT_COMPRESSED:
-            // case where we leave the partition in the compressed state
-            r = check_and_copy_compressed_sub_block_worker_cutdown(curr_rbuf, curr_sb, node, i);
-                if (r != 0) {
-                printk("copy and compress broke.\n");
-                goto cleanup;
-	    }
-            break;
-        case _PT_INVALID: // this is really bad
-        case _PT_ON_DISK: // it's supposed to be in memory.
-            break;
-	}
-    }
-    //*ftnode = node;
-    r = 0;
-    dump_ftnode_cutdown(node);  
-cleanup:
-    if (r == 0) {
-        //toku_ft_status_update_deserialize_times(node, deserialize_time, decompress_time);
-    }
-    if (r != 0) {
-        // NOTE: Right now, callers higher in the stack will assert on
-        // failure, so this is OK for production.  However, if we
-        // create tools that use this function to search for errors in
-        // the FT, then we will leak memory.
-        if (node) {
-            kfree(node);
-        }
-    }
-    return r;
-}
-
 static int __init treenvme_init(void)
 {
 #ifdef DEBUG
@@ -1942,7 +994,7 @@ static int __init treenvme_init(void)
 	
 	// this is how we keep the nodes in memory
 	node_cachep = KMEM_CACHE(tokunode, SLAB_HWCACHE_ALIGN | SLAB_PANIC);	
-
+	INIT_LIST_HEAD(&tctx->keys);
 	// DECLARE_HASHTABLE(tbl, 4);
 }
 
@@ -1950,12 +1002,15 @@ static void __exit treenvme_exit(void)
 {
 	kfree(tctx);
 }
+*/
 
+/*
 static const struct file_operations treenvme_ctrl_fops = {
 	.owner		= THIS_MODULE,
 	.mmap		= treenvme_mmap,
 // probably have to do release and flush
 };
+*/
 
 /*
 const struct block_device_operations treenvme_fops = {
@@ -1969,8 +1024,15 @@ const struct block_device_operations treenvme_fops = {
 };
 */
 
+/*@ddp*/
+/*
+ * struct ddp_info{
+	struct bpf_prog __rcu *ddp_prog;
+}
+*/
+
 MODULE_AUTHOR("Yu Jian <yujian.wu1@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");
-module_init(treenvme_init);
-module_exit(treenvme_exit);
+//module_init(treenvme_init);
+//module_exit(treenvme_exit);

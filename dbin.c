@@ -318,7 +318,7 @@ void dump_ftnode_partition(struct _ftnode_partition *bp) {
 	printk("Blocknum is %u\n", bp->blocknum.b);
 	printk("Workdone is %u\n", bp->workdone);
 	printk("State is %u\n", bp->state);
-	dump_ftnode_child_ptr_cutdown(&bp->ptr);
+	//dump_ftnode_child_ptr_cutdown(&bp->ptr);
 	printk("==================DUMPED==================\n");
 }
 
@@ -326,7 +326,7 @@ void dump_sub_block(struct _sub_block *sb) {
 	int i = 0;
 	printk("=============DUMPINGSUBBLOCK==============\n");
 	for (i = 0; i < sb->uncompressed_size; i++) {
-		printk("%c", ((char *)(sb->uncompressed_ptr))[i]);
+		printk(KERN_CONT "%c", ((char *)(sb->uncompressed_ptr))[i]);
 	}		
 	printk("==========DUMPED=SUB=BLOCK================\n");	
 }

@@ -39,6 +39,8 @@
  */
 #define NVME_MAX_KB_SZ	4096
 #define NVME_MAX_SEGS	127
+#define DEBUG 1
+//#define DEBUGS 1
 
 static int use_threaded_interrupts;
 module_param(use_threaded_interrupts, int, 0);
@@ -87,6 +89,7 @@ MODULE_PARM_DESC(dep_depth, "depth of dependencies.");
 
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
 static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
+//void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe);
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
 {
@@ -805,6 +808,28 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 			goto out_unmap_data;
 	}
 
+/*
+#ifdef DEBUG
+	printk(KERN_ERR "Got here before memcpy\n");
+#endif
+	//  handling of the entry buffer
+	if (req->bio != NULL)
+	if (req->bio->bi_opf != NULL)
+	if (req->bio->bi_opf && REQ_TREENVME)
+		if (bio_data(req->bio) != NULL)
+		memcpy(&nvme_req(req)->key, bio_data(req->bio), sizeof(unsigned long));
+
+#ifdef DEBUG
+	printk(KERN_ERR "INSIDE NVME:Key of %lu\n", nvme_req(req)->key);
+#endif
+*/
+
+#ifdef DEBUGS
+	if (!op_is_write(req_op(req)))
+	{
+		printk(KERN_ERR "SECTOR IS: %lu\n", req->__sector);
+	}
+#endif
 	blk_mq_start_request(req);
 	nvme_submit_cmd(nvmeq, &cmnd, bd->last);
 	return BLK_STS_OK;
@@ -933,11 +958,11 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
 		nvme_backpath(nvmeq, idx, req, cqe);
 	}
 	else {
-		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		//req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
 	}
 #else
-		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+		//req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
 		nvme_end_request(req, cqe->status, cqe->result);
 #endif
 	

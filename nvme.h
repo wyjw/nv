@@ -141,6 +141,7 @@ struct nvme_request {
 	u8			flags;
 	u16			status;
 	struct nvme_ctrl	*ctrl;
+	unsigned long key;
 };
 
 /*
@@ -422,6 +423,11 @@ struct treenvme_head {
 	struct nvme_ns __rcu	*current_path[];
 #endif
 };
+
+#ifdef CONFIG_NVME_TREENVME
+struct treenvme_ctx;
+
+#endif
 
 struct treenvme_ns {
 	struct list_head list;
@@ -714,15 +720,16 @@ int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd, void
 void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags);
 int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
-void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe);
+void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, volatile struct nvme_completion *cqe);
 #else
 /*
 void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid){
 }
 void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags){}
 int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg){}
-inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe){
-}*/
+*/
+inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, volatile struct nvme_completion *cqe){
+}
 #endif /* CONFIG_NVME_TREENVME */
 
 

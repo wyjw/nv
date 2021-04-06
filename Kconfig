@@ -26,9 +26,16 @@ config NVME_MULTIPATH
 
 config NVME_TREENVME
 	bool "treeNvme support"
-	depends on PCI && BLOCK && NVME_CORE
+	depends on NVME_CORE
 	---help---
 	   This option allows for treenvme.
+
+config BPF_TREENVME
+	bool "Support for eBPF program attached to treenvme"
+	depends on BPF_SYSCALL
+	select NVME_TREENVME
+	help
+	   Allow attach eBPF programs.
 
 config NVME_HWMON
 	bool "NVMe hardware monitoring"
